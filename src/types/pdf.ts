@@ -15,5 +15,15 @@ export interface PdfPageData {
 
 export interface SentenceBlock {
   text: string;
+  cleanedText?: string;
   elementIndices: number[]; // Keeps track of which visual lines belong to this sentence
+}
+
+export type ReadingMode = 'verbatim' | 'clean' | 'explanatory';
+export type AppTheme = 'light' | 'sepia' | 'dark';
+
+export interface ExplanationResult {
+  summary: string;
+  intuition: string;
+  terms: { term: string; definition: string }[];
 }

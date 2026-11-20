@@ -1,11 +1,145 @@
 use crate::models::{PdfPageData, PdfTextElement};
 use pdfium_render::prelude::*;
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use tauri::{AppHandle, Manager};
 
+static AUDIO_REQ_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct PiperWorker {
+    voice_name: String,
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl Drop for PiperWorker {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Holds a persistent Piper TTS process so the 63MB ONNX voice model is loaded once per voice.
+#[derive(Default)]
+pub struct PiperState {
+    worker: Mutex<Option<PiperWorker>>,
+}
+
+impl PiperWorker {
+    fn spawn(app: &AppHandle, voice_name: &str) -> Result<Self, String> {
+        if voice_name.is_empty()
+            || !voice_name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(format!("Invalid voice name: {}", voice_name));
+        }
+
+        let piper_path = app
+            .path()
+            .resolve(
+                "resources/piper/piper",
+                tauri::path::BaseDirectory::Resource,
+            )
+            .map_err(|e| format!("Could not find Piper: {}", e))?;
+
+        let piper_dir = piper_path
+            .parent()
+            .ok_or("Could not find Piper directory")?;
+
+        let model_path = app
+            .path()
+            .resolve(
+                format!("resources/models/{}/voice.onnx", voice_name),
+                tauri::path::BaseDirectory::Resource,
+            )
+            .map_err(|e| format!("Could not find Voice Model {}: {}", voice_name, e))?;
+
+        let config_path = app
+            .path()
+            .resolve(
+                format!("resources/models/{}/voice.json", voice_name),
+                tauri::path::BaseDirectory::Resource,
+            )
+            .map_err(|e| format!("Could not find Voice Config {}: {}", voice_name, e))?;
+
+        let temp_dir = app.path().temp_dir().map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
+
+        let mut child = Command::new(&piper_path)
+            .current_dir(piper_dir)
+            .env("LD_LIBRARY_PATH", piper_dir)
+            .args([
+                "--model",
+                model_path.to_str().ok_or("Invalid model path")?,
+                "--config",
+                config_path.to_str().ok_or("Invalid config path")?,
+                "--json-input",
+                "--output_dir",
+                temp_dir.to_str().ok_or("Invalid temp dir")?,
+                "-q",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Failed to start Piper TTS: {}", e))?;
+
+        let stdin = child.stdin.take().ok_or("Failed to open Piper stdin")?;
+        let stdout = child.stdout.take().ok_or("Failed to open Piper stdout")?;
+
+        Ok(Self {
+            voice_name: voice_name.to_string(),
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+        })
+    }
+
+    fn synthesize(&mut self, text: &str, out_path: &Path) -> Result<Vec<u8>, String> {
+        let clean_text = text.replace(['\r', '\n'], " ");
+        let out_str = out_path.to_str().ok_or("Invalid output audio path")?;
+
+        let payload = serde_json::json!({
+            "text": clean_text,
+            "output_file": out_str,
+        });
+
+        writeln!(self.stdin, "{}", payload).map_err(|e| format!("Piper write error: {}", e))?;
+        self.stdin
+            .flush()
+            .map_err(|e| format!("Piper flush error: {}", e))?;
+
+        let mut response_line = String::new();
+        let bytes_read = self
+            .stdout
+            .read_line(&mut response_line)
+            .map_err(|e| format!("Piper read error: {}", e))?;
+
+        if bytes_read == 0 {
+            return Err("Piper process closed stdout unexpectedly".to_string());
+        }
+
+        let audio_bytes =
+            std::fs::read(out_path).map_err(|e| format!("Failed to read audio: {}", e))?;
+        let _ = std::fs::remove_file(out_path);
+
+        Ok(audio_bytes)
+    }
+}
+
 #[tauri::command]
-pub fn parse_pdf(app: AppHandle, path: String) -> Result<Vec<PdfPageData>, String> {
+pub async fn parse_pdf(app: AppHandle, path: String) -> Result<Vec<PdfPageData>, String> {
+    tauri::async_runtime::spawn_blocking(move || parse_pdf_sync(&app, &path))
+        .await
+        .map_err(|e| format!("PDF parsing task failed: {}", e))?
+}
+
+fn parse_pdf_sync(app: &AppHandle, path: &str) -> Result<Vec<PdfPageData>, String> {
     println!("Loading the library");
 
     let resource_dir = app
@@ -26,7 +160,7 @@ pub fn parse_pdf(app: AppHandle, path: String) -> Result<Vec<PdfPageData>, Strin
 
     println!("Starting the file parsing");
     let document = pdfium
-        .load_pdf_from_file(&path, None)
+        .load_pdf_from_file(path, None)
         .map_err(|e| format!("Failed to load PDF: {}", e))?;
 
     println!("File loaded, starting the parsing");
@@ -126,75 +260,49 @@ fn merge_line_elements(line: &mut Vec<PdfTextElement>) -> PdfTextElement {
 }
 
 #[tauri::command]
-pub fn generate_audio(
+pub async fn generate_audio(
     app: tauri::AppHandle,
     text: String,
     voice_name: String,
-) -> Result<Vec<u8>, String> {
-    let piper_path = app
-        .path()
-        .resolve(
-            "resources/piper/piper",
-            tauri::path::BaseDirectory::Resource,
-        )
-        .map_err(|e| format!("Could not find Piper: {}", e))?;
+) -> Result<tauri::ipc::Response, String> {
+    let audio_bytes = tauri::async_runtime::spawn_blocking(move || {
+        let temp_dir = app.path().temp_dir().map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
 
-    let piper_dir = piper_path
-        .parent()
-        .ok_or("Could not find Piper directory")?;
+        let req_id = AUDIO_REQ_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let out_path = temp_dir.join(format!("pdftospeech_{}_{}.wav", std::process::id(), req_id));
 
-    // 1. Resolve the .onnx model path
-    let model_path_str = format!("resources/models/{}/voice.onnx", voice_name);
-    let model_path = app
-        .path()
-        .resolve(&model_path_str, tauri::path::BaseDirectory::Resource)
-        .map_err(|e| format!("Could not find Voice Model {}: {}", voice_name, e))?;
+        let state = app.state::<PiperState>();
+        let mut guard = state
+            .worker
+            .lock()
+            .map_err(|_| "Piper worker lock poisoned".to_string())?;
 
-    // 2. THE FIX: Resolve the .json config path explicitly
-    let config_path_str = format!("resources/models/{}/voice.json", voice_name);
-    let config_path = app
-        .path()
-        .resolve(&config_path_str, tauri::path::BaseDirectory::Resource)
-        .map_err(|e| format!("Could not find Voice Config {}: {}", voice_name, e))?;
+        // Respawn if voice changed or no worker exists yet
+        let needs_spawn = guard
+            .as_ref()
+            .map(|w| w.voice_name != voice_name)
+            .unwrap_or(true);
 
-    let out_path = app
-        .path()
-        .temp_dir()
-        .map_err(|e| e.to_string())?
-        .join("current_line.wav");
+        if needs_spawn {
+            *guard = None;
+            *guard = Some(PiperWorker::spawn(&app, &voice_name)?);
+        }
 
-    // 3. Pass BOTH the model and the config explicitly to Piper
-    let mut child = Command::new(&piper_path)
-        .current_dir(piper_dir)
-        .env("LD_LIBRARY_PATH", piper_dir)
-        .args([
-            "--model",
-            model_path.to_str().unwrap(),
-            "--config",
-            config_path.to_str().unwrap(), // ⬅️ Forcing Piper to read this exact file!
-            "--output_file",
-            out_path.to_str().unwrap(),
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to start Piper TTS: {}", e))?;
+        let first_attempt = guard.as_mut().unwrap().synthesize(&text, &out_path);
+        match first_attempt {
+            Ok(bytes) => Ok(bytes),
+            Err(_) => {
+                // Self-heal once if the background Piper process exited
+                let _ = std::fs::remove_file(&out_path);
+                *guard = None;
+                *guard = Some(PiperWorker::spawn(&app, &voice_name)?);
+                guard.as_mut().unwrap().synthesize(&text, &out_path)
+            }
+        }
+    })
+    .await
+    .map_err(|e| format!("Audio synthesis task failed: {}", e))??;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        Write::write_all(&mut stdin, text.as_bytes()).map_err(|e| e.to_string())?;
-    }
-
-    let output = child.wait_with_output().map_err(|e| e.to_string())?;
-
-    if !output.status.success() {
-        let error_msg = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Piper crashed: {}", error_msg));
-    }
-
-    let audio_bytes =
-        std::fs::read(&out_path).map_err(|e| format!("Failed to read audio: {}", e))?;
-    let _ = std::fs::remove_file(&out_path);
-
-    Ok(audio_bytes)
+    Ok(tauri::ipc::Response::new(audio_bytes))
 }
