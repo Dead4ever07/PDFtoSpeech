@@ -102,6 +102,15 @@
             Clean Academic
           </button>
         </div>
+
+        <button
+          class="filter-toggle-btn"
+          :class="{ active: skipHeadersFooters }"
+          @click="toggleSkipHeadersFooters"
+          title="Automatically skip running page headers, footers, and page numbers"
+        >
+          Skip Headers
+        </button>
       </div>
 
       <div class="divider"></div>
@@ -157,7 +166,7 @@
 
       <div class="divider"></div>
 
-      <!-- Explanatory Action Button -->
+      <!-- Explanatory & Export Actions -->
       <div class="control-group explain-group">
         <button
           class="explain-btn"
@@ -169,8 +178,34 @@
           <span class="explain-icon">💡</span>
           <span>Explain</span>
         </button>
+
+        <button
+          class="export-btn"
+          @click="exportFullText"
+          title="Save the full cleaned/read text of this PDF (.txt or .md)"
+        >
+          <span>💾 Save Text</span>
+        </button>
       </div>
 
+    </div>
+
+    <!-- Audio Export Progress Banner -->
+    <div v-if="isExportingAudio" class="export-banner">
+      <span class="export-label">
+        🎧 Exporting Audio: {{ exportProgress.current }} / {{ exportProgress.total }} segments
+      </span>
+      <div class="export-bar-track">
+        <div
+          class="export-bar-fill"
+          :style="{
+            width: exportProgress.total
+              ? `${Math.round((exportProgress.current / exportProgress.total) * 100)}%`
+              : '0%'
+          }"
+        ></div>
+      </div>
+      <button class="cancel-export-btn" @click="cancelAudioExport">Cancel</button>
     </div>
 
     <!-- Active Sentence Sub-bar / Teleprompter ticker -->
@@ -194,10 +229,13 @@ const {
   speechSpeed,
   zoomLevel,
   readingMode,
+  skipHeadersFooters,
   currentSentenceIndex,
   currentSentence,
   pageSentences,
   isExplaining,
+  isExportingAudio,
+  exportProgress,
   toggleReading,
   stopReading,
   prevPage,
@@ -210,7 +248,10 @@ const {
   zoomOut,
   resetZoom,
   setReadingMode,
-  requestExplanation
+  toggleSkipHeadersFooters,
+  requestExplanation,
+  exportFullText,
+  cancelAudioExport
 } = usePdfReader();
 
 const handlePageInput = (event: Event) => {
@@ -376,8 +417,31 @@ const handleSpeedChange = (event: Event) => {
 
 .mode-btn.active {
   background: var(--card-bg, #ffffff);
-  color: var(--accent-color, #2563eb);
+  color: var(--accent-text, #2563eb);
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+}
+
+.filter-toggle-btn {
+  border: 1px solid var(--border-color, #cbd5e1);
+  background: var(--card-bg, #ffffff);
+  color: var(--text-secondary, #64748b);
+  padding: 5px 10px;
+  border-radius: 7px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.filter-toggle-btn:hover {
+  border-color: var(--accent-color, #2563eb);
+  color: var(--text-primary, #0f172a);
+}
+
+.filter-toggle-btn.active {
+  background: var(--accent-light, #eff6ff);
+  border-color: var(--accent-color, #2563eb);
+  color: var(--accent-text, #2563eb);
 }
 
 /* Setting Items */
@@ -410,6 +474,12 @@ const handleSpeedChange = (event: Event) => {
 
 .select-input:focus {
   border-color: var(--accent-color, #2563eb);
+}
+
+.select-input option,
+.select-input optgroup {
+  background-color: var(--card-bg, #ffffff);
+  color: var(--text-primary, #0f172a);
 }
 
 /* Zoom controls */
@@ -471,6 +541,71 @@ const handleSpeedChange = (event: Event) => {
   cursor: not-allowed;
 }
 
+.export-btn {
+  background: var(--card-bg, #ffffff);
+  border: 1px solid var(--border-color, #cbd5e1);
+  color: var(--text-primary, #0f172a);
+  border-radius: 8px;
+  padding: 6px 11px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.export-btn:hover {
+  border-color: var(--accent-color, #2563eb);
+  color: var(--accent-text, #2563eb);
+  background: var(--accent-light, #eff6ff);
+}
+
+.export-banner {
+  background: var(--accent-light, #eff6ff);
+  border-top: 1px solid var(--border-color, #e2e8f0);
+  padding: 6px 16px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 12px;
+}
+
+.export-label {
+  font-weight: 600;
+  color: var(--accent-text, #2563eb);
+  white-space: nowrap;
+}
+
+.export-bar-track {
+  flex: 1;
+  height: 6px;
+  background: var(--border-color, #cbd5e1);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.export-bar-fill {
+  height: 100%;
+  background: var(--accent-color, #2563eb);
+  transition: width 0.2s ease;
+}
+
+.cancel-export-btn {
+  background: var(--card-bg, #ffffff);
+  border: 1px solid var(--border-color, #cbd5e1);
+  color: var(--text-primary, #0f172a);
+  border-radius: 6px;
+  padding: 3px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.cancel-export-btn:hover {
+  background: #ef4444;
+  border-color: #ef4444;
+  color: #ffffff;
+}
+
 /* Sentence Ticker Bar */
 .sentence-ticker {
   background: var(--ticker-bg, #f8fafc);
@@ -488,7 +623,7 @@ const handleSpeedChange = (event: Event) => {
   font-size: 10px;
   text-transform: uppercase;
   letter-spacing: 0.5px;
-  color: var(--accent-color, #2563eb);
+  color: var(--accent-text, #2563eb);
   background: var(--accent-light, #eff6ff);
   padding: 2px 6px;
   border-radius: 4px;

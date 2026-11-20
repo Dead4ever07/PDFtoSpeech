@@ -9,12 +9,12 @@ use ort::{
 use pdfium_render::prelude::*;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, CStr, CString};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 static AUDIO_REQ_COUNTER: AtomicU64 = AtomicU64::new(0);
 const KOKORO_SAMPLE_RATE: u32 = 24_000;
@@ -169,6 +169,17 @@ pub struct KokoroEngine {
 #[derive(Default)]
 pub struct KokoroState {
     engine: tauri::async_runtime::Mutex<Option<Arc<KokoroEngine>>>,
+}
+
+#[derive(Default)]
+pub struct ExportState {
+    cancelled: AtomicBool,
+}
+
+#[derive(serde::Serialize, Clone)]
+struct AudioExportProgress {
+    current: usize,
+    total: usize,
 }
 
 fn split_clauses_with_punct(text: &str) -> Vec<(String, Option<char>)> {
@@ -941,46 +952,182 @@ pub async fn generate_audio(
         return Ok(tauri::ipc::Response::new(wav_bytes));
     }
 
-    let audio_bytes = tauri::async_runtime::spawn_blocking(move || {
-        let temp_dir = app.path().temp_dir().map_err(|e| e.to_string())?;
-        std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
-
-        let req_id = AUDIO_REQ_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let out_path = temp_dir.join(format!("pdftospeech_{}_{}.wav", std::process::id(), req_id));
-
-        let state = app.state::<PiperState>();
-        let mut guard = state
-            .worker
-            .lock()
-            .map_err(|_| "Piper worker lock poisoned".to_string())?;
-
-        // Respawn if voice changed or no worker exists yet
-        let needs_spawn = guard
-            .as_ref()
-            .map(|w| w.voice_name != voice_name)
-            .unwrap_or(true);
-
-        if needs_spawn {
-            *guard = None;
-            *guard = Some(PiperWorker::spawn(&app, &voice_name)?);
-        }
-
-        let first_attempt = guard.as_mut().unwrap().synthesize(&text, &out_path);
-        match first_attempt {
-            Ok(bytes) => Ok(bytes),
-            Err(_) => {
-                // Self-heal once if the background Piper process exited
-                let _ = std::fs::remove_file(&out_path);
-                *guard = None;
-                *guard = Some(PiperWorker::spawn(&app, &voice_name)?);
-                guard.as_mut().unwrap().synthesize(&text, &out_path)
-            }
-        }
-    })
-    .await
-    .map_err(|e| format!("Audio synthesis task failed: {}", e))??;
+    let audio_bytes =
+        tauri::async_runtime::spawn_blocking(move || synthesize_piper_blocking(&app, &text, &voice_name))
+            .await
+            .map_err(|e| format!("Audio synthesis task failed: {}", e))??;
 
     Ok(tauri::ipc::Response::new(audio_bytes))
+}
+
+#[tauri::command]
+pub async fn save_text_file(path: String, content: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        std::fs::write(&path, content.as_bytes())
+            .map_err(|e| format!("Failed to save file '{}': {}", path, e))
+    })
+    .await
+    .map_err(|e| format!("Save task failed: {}", e))?
+}
+
+#[tauri::command]
+pub fn cancel_audio_export(state: tauri::State<'_, ExportState>) {
+    state.cancelled.store(true, Ordering::SeqCst);
+}
+
+fn write_wav_header(
+    writer: &mut impl Write,
+    sample_rate: u32,
+    data_len: u32,
+) -> std::io::Result<()> {
+    writer.write_all(b"RIFF")?;
+    writer.write_all(&(36u32.saturating_add(data_len)).to_le_bytes())?;
+    writer.write_all(b"WAVEfmt ")?;
+    writer.write_all(&16u32.to_le_bytes())?;
+    writer.write_all(&1u16.to_le_bytes())?;
+    writer.write_all(&1u16.to_le_bytes())?;
+    writer.write_all(&sample_rate.to_le_bytes())?;
+    writer.write_all(&(sample_rate * 2).to_le_bytes())?;
+    writer.write_all(&2u16.to_le_bytes())?;
+    writer.write_all(&16u16.to_le_bytes())?;
+    writer.write_all(b"data")?;
+    writer.write_all(&data_len.to_le_bytes())?;
+    Ok(())
+}
+
+fn extract_wav_pcm_info(wav: &[u8]) -> Option<(u32, &[u8])> {
+    if wav.len() < 44 || &wav[0..4] != b"RIFF" || &wav[8..12] != b"WAVE" {
+        return None;
+    }
+    let sample_rate = u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]);
+    let mut pos = 12usize;
+    while pos + 8 <= wav.len() {
+        let chunk_id = &wav[pos..pos + 4];
+        let chunk_size =
+            u32::from_le_bytes([wav[pos + 4], wav[pos + 5], wav[pos + 6], wav[pos + 7]]) as usize;
+        let data_start = pos + 8;
+        if chunk_id == b"data" {
+            let data_end = data_start.saturating_add(chunk_size).min(wav.len());
+            return Some((sample_rate, &wav[data_start..data_end]));
+        }
+        pos = data_start.saturating_add(chunk_size + (chunk_size % 2));
+    }
+    None
+}
+
+fn synthesize_piper_blocking(
+    app: &AppHandle,
+    text: &str,
+    voice_name: &str,
+) -> Result<Vec<u8>, String> {
+    let temp_dir = app.path().temp_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
+
+    let req_id = AUDIO_REQ_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let out_path = temp_dir.join(format!("pdftospeech_{}_{}.wav", std::process::id(), req_id));
+
+    let state = app.state::<PiperState>();
+    let mut guard = state
+        .worker
+        .lock()
+        .map_err(|_| "Piper worker lock poisoned".to_string())?;
+
+    let needs_spawn = guard
+        .as_ref()
+        .map(|w| w.voice_name != voice_name)
+        .unwrap_or(true);
+
+    if needs_spawn {
+        *guard = None;
+        *guard = Some(PiperWorker::spawn(app, voice_name)?);
+    }
+
+    let first_attempt = guard.as_mut().unwrap().synthesize(text, &out_path);
+    match first_attempt {
+        Ok(bytes) => Ok(bytes),
+        Err(_) => {
+            let _ = std::fs::remove_file(&out_path);
+            *guard = None;
+            *guard = Some(PiperWorker::spawn(app, voice_name)?);
+            guard.as_mut().unwrap().synthesize(text, &out_path)
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn export_audio_file(
+    app: AppHandle,
+    path: String,
+    chunks: Vec<String>,
+    voice_name: String,
+) -> Result<(), String> {
+    let export_state = app.state::<ExportState>();
+    export_state.cancelled.store(false, Ordering::SeqCst);
+
+    let total = chunks.len();
+    if total == 0 {
+        return Err("No readable text found to export.".to_string());
+    }
+
+    let mut file = std::fs::File::create(&path)
+        .map_err(|e| format!("Failed to create output file '{}': {}", path, e))?;
+    let mut sample_rate = KOKORO_SAMPLE_RATE;
+    write_wav_header(&mut file, sample_rate, 0).map_err(|e| e.to_string())?;
+    let mut total_pcm_bytes: u64 = 0;
+
+    let kokoro_cfg = map_kokoro_voice(&voice_name);
+    let kokoro_engine = if kokoro_cfg.is_some() {
+        Some(get_or_init_kokoro(&app).await?)
+    } else {
+        None
+    };
+
+    for (idx, chunk) in chunks.into_iter().enumerate() {
+        if app.state::<ExportState>().cancelled.load(Ordering::SeqCst) {
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            return Err("Export cancelled.".to_string());
+        }
+
+        if let (Some(cfg), Some(engine)) = (kokoro_cfg, kokoro_engine.as_ref()) {
+            let samples = engine.synthesize_text(&chunk, cfg).await?;
+            for sample in samples {
+                let pcm = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
+                file.write_all(&pcm.to_le_bytes())
+                    .map_err(|e| e.to_string())?;
+                total_pcm_bytes += 2;
+            }
+        } else {
+            let app_clone = app.clone();
+            let voice_clone = voice_name.clone();
+            let wav = tauri::async_runtime::spawn_blocking(move || {
+                synthesize_piper_blocking(&app_clone, &chunk, &voice_clone)
+            })
+            .await
+            .map_err(|e| format!("Audio export task failed: {}", e))??;
+
+            if let Some((sr, pcm_data)) = extract_wav_pcm_info(&wav) {
+                sample_rate = sr;
+                file.write_all(pcm_data).map_err(|e| e.to_string())?;
+                total_pcm_bytes += pcm_data.len() as u64;
+            }
+        }
+
+        let _ = app.emit(
+            "audio-export-progress",
+            AudioExportProgress {
+                current: idx + 1,
+                total,
+            },
+        );
+    }
+
+    let clamped_data_len = total_pcm_bytes.min(u32::MAX as u64 - 36) as u32;
+    file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    write_wav_header(&mut file, sample_rate, clamped_data_len).map_err(|e| e.to_string())?;
+    file.flush().map_err(|e| e.to_string())?;
+
+    Ok(())
 }
 
 #[cfg(test)]

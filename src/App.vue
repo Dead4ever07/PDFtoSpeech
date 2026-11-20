@@ -133,6 +133,7 @@ html, body {
    ============================================================================ */
 
 :root, [data-theme="light"] {
+  color-scheme: light;
   --bg-primary: #f8fafc;
   --viewer-bg: #f1f5f9;
   --titlebar-bg: #ffffff;
@@ -143,6 +144,10 @@ html, body {
   --ticker-bg: #f8fafc;
   --dropdown-bg: #ffffff;
   --bg-hover: #f1f5f9;
+  --overlay-bg: rgba(255, 255, 255, 0.85);
+  --spinner-track: #e2e8f0;
+  --pdf-page-bg: #ffffff;
+  --pdf-filter: none;
 
   --border-color: #e2e8f0;
   --text-primary: #0f172a;
@@ -151,12 +156,29 @@ html, body {
 
   --accent-color: #2563eb;
   --accent-light: #eff6ff;
+  --accent-text: #2563eb;
+
+  --active-sentence-bg: #fffbeb;
+  --active-pill-bg: #fef3c7;
+  --active-pill-text: #92400e;
+
+  --hero-card-bg: linear-gradient(135deg, #f5f3ff 0%, #ede9fe 100%);
+  --hero-card-border: #ddd6fe;
+  --hero-card-title: #5b21b6;
+  --hero-card-desc: #6d28d9;
+
+  --intuition-bg: #f0fdf4;
+  --intuition-border: #bbf7d0;
+  --intuition-title: #166534;
+  --intuition-text: #14532d;
+  --term-badge-color: #7c3aed;
 
   --highlight-bg: rgba(245, 158, 11, 0.38);
   --highlight-glow: rgba(245, 158, 11, 0.65);
 }
 
 [data-theme="sepia"] {
+  color-scheme: light;
   --bg-primary: #fbf0d9;
   --viewer-bg: #f4e8cf;
   --titlebar-bg: #f7eed8;
@@ -167,6 +189,10 @@ html, body {
   --ticker-bg: #f5e9d3;
   --dropdown-bg: #fbf3e4;
   --bg-hover: #eedec0;
+  --overlay-bg: rgba(251, 240, 217, 0.88);
+  --spinner-track: #e2d1b3;
+  --pdf-page-bg: #fefcf7;
+  --pdf-filter: sepia(0.18) brightness(0.97);
 
   --border-color: #e2d1b3;
   --text-primary: #3b2c1a;
@@ -175,12 +201,29 @@ html, body {
 
   --accent-color: #b45309;
   --accent-light: #fef3c7;
+  --accent-text: #b45309;
+
+  --active-sentence-bg: #fef3c7;
+  --active-pill-bg: #fef3c7;
+  --active-pill-text: #92400e;
+
+  --hero-card-bg: linear-gradient(135deg, #f5f3ff 0%, #ede9fe 100%);
+  --hero-card-border: #ddd6fe;
+  --hero-card-title: #5b21b6;
+  --hero-card-desc: #6d28d9;
+
+  --intuition-bg: #f0fdf4;
+  --intuition-border: #bbf7d0;
+  --intuition-title: #166534;
+  --intuition-text: #14532d;
+  --term-badge-color: #7c3aed;
 
   --highlight-bg: rgba(217, 119, 6, 0.35);
   --highlight-glow: rgba(217, 119, 6, 0.6);
 }
 
 [data-theme="dark"] {
+  color-scheme: dark;
   --bg-primary: #0f172a;
   --viewer-bg: #0b1120;
   --titlebar-bg: #1e293b;
@@ -191,14 +234,34 @@ html, body {
   --ticker-bg: #172133;
   --dropdown-bg: #1e293b;
   --bg-hover: #334155;
+  --overlay-bg: rgba(15, 23, 42, 0.88);
+  --spinner-track: #334155;
+  --pdf-page-bg: #1e1e1e;
+  --pdf-filter: invert(0.88) hue-rotate(180deg);
 
   --border-color: #334155;
   --text-primary: #f8fafc;
   --text-secondary: #cbd5e1;
-  --text-muted: #64748b;
+  --text-muted: #94a3b8;
 
   --accent-color: #3b82f6;
   --accent-light: #1e3a8a;
+  --accent-text: #93c5fd;
+
+  --active-sentence-bg: rgba(245, 158, 11, 0.16);
+  --active-pill-bg: rgba(245, 158, 11, 0.22);
+  --active-pill-text: #fcd34d;
+
+  --hero-card-bg: linear-gradient(135deg, #2e1065 0%, #1e1b4b 100%);
+  --hero-card-border: #4c1d95;
+  --hero-card-title: #e9d5ff;
+  --hero-card-desc: #c4b5fd;
+
+  --intuition-bg: rgba(22, 101, 52, 0.24);
+  --intuition-border: #166534;
+  --intuition-title: #86efac;
+  --intuition-text: #dcfce7;
+  --term-badge-color: #c4b5fd;
 
   --highlight-bg: rgba(251, 191, 36, 0.42);
   --highlight-glow: rgba(251, 191, 36, 0.75);

@@ -217,7 +217,7 @@ const {
 .tab-btn.active {
   background: var(--card-bg, #ffffff);
   border-color: var(--border-color, #cbd5e1);
-  color: var(--accent-color, #2563eb);
+  color: var(--accent-text, #2563eb);
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
 }
 
@@ -255,7 +255,7 @@ const {
 .badge {
   font-size: 11px;
   font-weight: 600;
-  color: var(--accent-color, #2563eb);
+  color: var(--accent-text, #2563eb);
   background: var(--accent-light, #eff6ff);
   padding: 2px 8px;
   border-radius: 12px;
@@ -286,7 +286,7 @@ const {
 
 .sentence-item.active {
   border-color: #f59e0b;
-  background: #fffbeb;
+  background: var(--active-sentence-bg, #fffbeb);
   box-shadow: 0 0 0 1px #f59e0b;
 }
 
@@ -322,8 +322,8 @@ const {
 
 /* Explain View */
 .hero-card {
-  background: linear-gradient(135deg, #f5f3ff 0%, #ede9fe 100%);
-  border: 1px solid #ddd6fe;
+  background: var(--hero-card-bg, linear-gradient(135deg, #f5f3ff 0%, #ede9fe 100%));
+  border: 1px solid var(--hero-card-border, #ddd6fe);
   padding: 14px;
   border-radius: 10px;
   margin-bottom: 16px;
@@ -332,12 +332,12 @@ const {
 .hero-card h4 {
   margin: 0 0 6px 0;
   font-size: 14px;
-  color: #5b21b6;
+  color: var(--hero-card-title, #5b21b6);
 }
 
 .card-desc {
   font-size: 12px;
-  color: #6d28d9;
+  color: var(--hero-card-desc, #6d28d9);
   line-height: 1.4;
   margin: 0 0 12px 0;
 }
@@ -398,16 +398,16 @@ const {
 }
 
 .intuition-block {
-  background: #f0fdf4;
-  border-color: #bbf7d0;
+  background: var(--intuition-bg, #f0fdf4);
+  border-color: var(--intuition-border, #bbf7d0);
 }
 
 .intuition-block h5 {
-  color: #166534;
+  color: var(--intuition-title, #166534);
 }
 
 .intuition-block p {
-  color: #14532d;
+  color: var(--intuition-text, #14532d);
 }
 
 .terms-list {
@@ -429,7 +429,7 @@ const {
 .term-badge {
   font-weight: 700;
   font-size: 11px;
-  color: #7c3aed;
+  color: var(--term-badge-color, #7c3aed);
 }
 
 .term-def {
@@ -489,6 +489,7 @@ const {
 
 .page-tile {
   background: var(--card-bg, #ffffff);
+  color: var(--text-primary, #0f172a);
   border: 1px solid var(--border-color, #cbd5e1);
   padding: 10px 4px;
   border-radius: 6px;

@@ -6,6 +6,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(pdf_handler::PiperState::default())
         .manage(pdf_handler::KokoroState::default())
+        .manage(pdf_handler::ExportState::default())
         .setup(|app| {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -20,7 +21,10 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             pdf_handler::parse_pdf,
-            pdf_handler::generate_audio])
+            pdf_handler::generate_audio,
+            pdf_handler::save_text_file,
+            pdf_handler::export_audio_file,
+            pdf_handler::cancel_audio_export])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

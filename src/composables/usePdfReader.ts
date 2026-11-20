@@ -1,6 +1,7 @@
 import { ref, computed } from 'vue';
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
-import { open } from '@tauri-apps/plugin-dialog';
+import { listen } from '@tauri-apps/api/event';
+import { open, save } from '@tauri-apps/plugin-dialog';
 
 import type { PdfPageData, SentenceBlock, ReadingMode, AppTheme, ExplanationResult } from '../types/pdf';
 
@@ -18,10 +19,13 @@ const speechSpeed = ref<number>(1.0);
 const zoomLevel = ref<number>(1.0);
 const theme = ref<AppTheme>('light');
 const readingMode = ref<ReadingMode>('clean');
+const skipHeadersFooters = ref<boolean>(true);
 const isSidebarOpen = ref<boolean>(false);
 const activeSidebarTab = ref<'transcript' | 'explain' | 'pages'>('transcript');
 const isExplaining = ref<boolean>(false);
 const currentExplanation = ref<ExplanationResult | null>(null);
+const isExportingAudio = ref<boolean>(false);
+const exportProgress = ref<{ current: number; total: number }>({ current: 0, total: 0 });
 
 let currentAudio: HTMLAudioElement | null = null;
 const audioCache = ref<Map<string, string>>(new Map());
@@ -180,6 +184,35 @@ function clearAudioCache() {
   audioCache.value.clear();
 }
 
+function normalizeMarginSignature(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/\d+/g, '#')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isStandalonePageNumber(text: string): boolean {
+  return /^(?:[-–—]\s*)?(?:\d{1,4}|[ivxlcdm]{1,7}|page\s+\d+(?:\s*(?:of|\/)\s*\d+)?|\d+\s*\/\s*\d+)(?:\s*[-–—])?$/i.test(
+    text.trim()
+  );
+}
+
+function isMarginBoilerplate(text: string): boolean {
+  return /^(?:arxiv:|preprint\b|submitted\s+to\b|under\s+review\b|published\s+(?:as|in)\b|copyright\b|©|doi:|https?:\/\/|proceedings\s+of\b|authorized\s+licensed\s+use|downloaded\s+on\b)/i.test(
+    text.trim()
+  );
+}
+
+function getMedianBodyHeight(elements: PdfPageData['elements']): number {
+  const heights = elements
+    .map((e) => e.height)
+    .filter((h) => h > 0)
+    .sort((a, b) => a - b);
+  if (heights.length === 0) return 10;
+  return heights[Math.floor(heights.length / 2)];
+}
+
 export function usePdfReader() {
 
   const documentName = computed<string>(() => {
@@ -190,13 +223,85 @@ export function usePdfReader() {
 
   const totalPages = computed<number>(() => pdfPages.value.length);
 
-  const pageSentences = computed<SentenceBlock[]>(() => {
-    const page = pdfPages.value[currentPageIndex.value];
-    if (!page) return [];
+  // Detect running headers/footers that repeat across multiple pages in top/bottom 12% margins
+  const repeatedMarginSignatures = computed<Set<string>>(() => {
+    const counts = new Map<string, number>();
+    if (pdfPages.value.length < 2) return new Set();
 
+    for (const page of pdfPages.value) {
+      const seenOnPage = new Set<string>();
+      const topLimit = page.height * 0.12;
+      const bottomLimit = page.height * 0.88;
+
+      for (const el of page.elements) {
+        const text = el.text.trim();
+        if (!text) continue;
+        const inMargin = el.y < topLimit || el.y + el.height > bottomLimit;
+        if (!inMargin) continue;
+
+        const sig = normalizeMarginSignature(text);
+        if (sig.length >= 2) {
+          seenOnPage.add(sig);
+        }
+      }
+
+      seenOnPage.forEach((sig) => {
+        counts.set(sig, (counts.get(sig) ?? 0) + 1);
+      });
+    }
+
+    const repeated = new Set<string>();
+    counts.forEach((count, sig) => {
+      if (count >= 2) repeated.add(sig);
+    });
+    return repeated;
+  });
+
+  const isHeaderOrFooterElement = (
+    page: PdfPageData,
+    index: number,
+    medianHeight: number
+  ): boolean => {
+    const el = page.elements[index];
+    const text = el.text.trim();
+    if (!text) return true;
+
+    const inTopZone = el.y < page.height * 0.11;
+    const inBottomZone = el.y + el.height > page.height * 0.89 || el.y > page.height * 0.88;
+    if (!inTopZone && !inBottomZone) return false;
+
+    if (isStandalonePageNumber(text)) return true;
+    if (repeatedMarginSignatures.value.has(normalizeMarginSignature(text))) return true;
+    if (isMarginBoilerplate(text)) return true;
+
+    // Catch isolated small header/footer lines in the extreme margin even on single-page PDFs
+    if (el.height <= medianHeight * 1.08 && text.length <= 120) {
+      if (el.y < page.height * 0.075) {
+        const nextEl = page.elements[index + 1];
+        const gapBelow = nextEl ? nextEl.y - (el.y + el.height) : page.height;
+        if (gapBelow > el.height * 1.5 && !/[,;\-–]$/.test(text)) {
+          return true;
+        }
+      }
+      if (el.y > page.height * 0.915) {
+        const prevEl = index > 0 ? page.elements[index - 1] : null;
+        const gapAbove = prevEl ? el.y - (prevEl.y + prevEl.height) : page.height;
+        if (gapAbove > (prevEl?.height ?? el.height) * 1.5 && !/^[a-z]/.test(text)) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  };
+
+  const buildPageSentences = (page: PdfPageData): SentenceBlock[] => {
+    const medianHeight = getMedianBodyHeight(page.elements);
     const sentences: SentenceBlock[] = [];
     let currentText = "";
     let currentIndices: number[] = [];
+    let lastIncludedIndex = -1;
+    let nextStartsParagraph = true;
 
     const flushSentence = () => {
       const raw = currentText.trim();
@@ -204,8 +309,10 @@ export function usePdfReader() {
         sentences.push({
           text: raw,
           cleanedText: cleanAcademicText(raw),
-          elementIndices: [...currentIndices]
+          elementIndices: [...currentIndices],
+          startsParagraph: nextStartsParagraph
         });
+        nextStartsParagraph = false;
       }
       currentText = "";
       currentIndices = [];
@@ -216,17 +323,23 @@ export function usePdfReader() {
       const text = el.text.trim();
       if (!text) continue;
 
+      if (skipHeadersFooters.value && isHeaderOrFooterElement(page, i, medianHeight)) {
+        continue;
+      }
+
       // Check if there is a massive vertical gap (a new paragraph)
-      if (i > 0 && currentIndices.length > 0) {
-        const prevEl = page.elements[i - 1];
+      if (lastIncludedIndex >= 0) {
+        const prevEl = page.elements[lastIncludedIndex];
         const gap = el.y - (prevEl.y + prevEl.height);
 
-        // If gap is larger than 1.5x line height, break sentence
+        // If gap is larger than 1.5x line height, break sentence and mark a paragraph boundary
         if (gap > prevEl.height * 1.5) {
           flushSentence();
+          nextStartsParagraph = true;
         }
       }
 
+      lastIncludedIndex = i;
       const segments = splitLineIntoSegments(text);
       for (const segment of segments) {
         currentText += (currentText ? " " : "") + segment;
@@ -243,6 +356,12 @@ export function usePdfReader() {
     flushSentence();
 
     return sentences;
+  };
+
+  const pageSentences = computed<SentenceBlock[]>(() => {
+    const page = pdfPages.value[currentPageIndex.value];
+    if (!page) return [];
+    return buildPageSentences(page);
   });
 
   const currentSentence = computed<SentenceBlock | null>(() => {
@@ -427,6 +546,12 @@ export function usePdfReader() {
     readingMode.value = mode;
     // Clear cache so changes take effect immediately
     clearAudioCache();
+  };
+
+  const toggleSkipHeadersFooters = () => {
+    stopReading();
+    skipHeadersFooters.value = !skipHeadersFooters.value;
+    currentSentenceIndex.value = -1;
   };
 
   const jumpToSentence = (sIndex: number, autoPlay: boolean = true) => {
@@ -626,6 +751,138 @@ export function usePdfReader() {
     }
   };
 
+  const getSentenceReadText = (sentence: SentenceBlock): string => {
+    if (readingMode.value === 'clean' || readingMode.value === 'explanatory') {
+      return sentence.cleanedText || cleanAcademicText(sentence.text);
+    }
+    return sentence.text;
+  };
+
+  const buildFullDocumentText = (asMarkdown: boolean): string => {
+    const baseTitle = documentName.value.replace(/\.pdf$/i, '') || 'Document';
+    const sections: string[] = [];
+
+    if (asMarkdown) {
+      sections.push(`# ${baseTitle}`);
+    }
+
+    for (const page of pdfPages.value) {
+      const sentences = buildPageSentences(page);
+      if (sentences.length === 0) continue;
+
+      const paragraphs: string[] = [];
+      let currentParagraph: string[] = [];
+
+      for (const sentence of sentences) {
+        const text = getSentenceReadText(sentence).trim();
+        if (!text) continue;
+
+        if (sentence.startsParagraph && currentParagraph.length > 0) {
+          paragraphs.push(currentParagraph.join(' '));
+          currentParagraph = [];
+        }
+        currentParagraph.push(text);
+      }
+
+      if (currentParagraph.length > 0) {
+        paragraphs.push(currentParagraph.join(' '));
+      }
+
+      if (paragraphs.length > 0) {
+        if (asMarkdown) {
+          sections.push(`## Page ${page.page_number}\n\n${paragraphs.join('\n\n')}`);
+        } else {
+          sections.push(paragraphs.join('\n\n'));
+        }
+      }
+    }
+
+    return sections.join('\n\n');
+  };
+
+  const exportFullText = async () => {
+    if (pdfPages.value.length === 0) return;
+    const baseName = documentName.value.replace(/\.pdf$/i, '') || 'document';
+
+    try {
+      const targetPath = await save({
+        defaultPath: `${baseName}_read_text.txt`,
+        filters: [
+          { name: 'Plain Text', extensions: ['txt'] },
+          { name: 'Markdown', extensions: ['md'] }
+        ]
+      });
+      if (!targetPath) return;
+
+      const asMarkdown = targetPath.toLowerCase().endsWith('.md');
+      const content = buildFullDocumentText(asMarkdown);
+      await invoke('save_text_file', { path: targetPath, content });
+    } catch (error) {
+      console.error('Failed to export text:', error);
+      alert(`Could not save text: ${error}`);
+    }
+  };
+
+  const exportFullAudio = async () => {
+    if (pdfPages.value.length === 0 || isExportingAudio.value) return;
+    const baseName = documentName.value.replace(/\.pdf$/i, '') || 'document';
+
+    const chunks: string[] = [];
+    for (const page of pdfPages.value) {
+      for (const sentence of buildPageSentences(page)) {
+        const text = getSentenceReadText(sentence);
+        chunks.push(...splitIntoSpeechChunks(text));
+      }
+    }
+
+    if (chunks.length === 0) {
+      alert('No readable text found in this PDF.');
+      return;
+    }
+
+    let unlisten: (() => void) | null = null;
+    try {
+      const targetPath = await save({
+        defaultPath: `${baseName}_audio.wav`,
+        filters: [{ name: 'WAV Audio', extensions: ['wav'] }]
+      });
+      if (!targetPath) return;
+
+      isExportingAudio.value = true;
+      exportProgress.value = { current: 0, total: chunks.length };
+
+      unlisten = await listen<{ current: number; total: number }>(
+        'audio-export-progress',
+        (event) => {
+          exportProgress.value = event.payload;
+        }
+      );
+
+      await invoke('export_audio_file', {
+        path: targetPath,
+        chunks,
+        voiceName: selectedVoice.value
+      });
+    } catch (error) {
+      const msg = String(error);
+      if (!msg.includes('cancelled')) {
+        console.error('Failed to export audio:', error);
+        alert(`Could not export audio: ${msg}`);
+      }
+    } finally {
+      if (unlisten) unlisten();
+      isExportingAudio.value = false;
+    }
+  };
+
+  const cancelAudioExport = async () => {
+    try {
+      await invoke('cancel_audio_export');
+    } catch (error) {
+      console.error('Failed to cancel export:', error);
+    }
+  };
+
   return {
     pdfPath,
     pdfUrl,
@@ -641,6 +898,7 @@ export function usePdfReader() {
     zoomLevel,
     theme,
     readingMode,
+    skipHeadersFooters,
     currentSentenceIndex,
     currentSentence,
     pageSentences,
@@ -648,6 +906,8 @@ export function usePdfReader() {
     activeSidebarTab,
     isExplaining,
     currentExplanation,
+    isExportingAudio,
+    exportProgress,
     openFile,
     loadDocumentPath,
     toggleReading,
@@ -665,6 +925,10 @@ export function usePdfReader() {
     resetZoom,
     setTheme,
     setReadingMode,
-    requestExplanation
+    toggleSkipHeadersFooters,
+    requestExplanation,
+    exportFullText,
+    exportFullAudio,
+    cancelAudioExport
   };
 }

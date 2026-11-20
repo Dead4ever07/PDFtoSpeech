@@ -12,6 +12,14 @@
           <div class="dropdown-item" @click.stop="handleOpenFile">
             <span>📄</span> Open PDF Document...
           </div>
+          <template v-if="totalPages > 0">
+            <div class="dropdown-item" @click.stop="handleExportText">
+              <span>💾</span> Save Full Read Text (.txt / .md)...
+            </div>
+            <div class="dropdown-item" @click.stop="handleExportAudio">
+              <span>🎧</span> Export Full Audio (.wav)...
+            </div>
+          </template>
           <div class="dropdown-separator"></div>
           <div class="dropdown-item" @click.stop="toggleSidebar('transcript')">
             <span>📝</span> Toggle Transcript
@@ -104,7 +112,9 @@ const {
   theme,
   setTheme,
   isSidebarOpen,
-  activeSidebarTab
+  activeSidebarTab,
+  exportFullText,
+  exportFullAudio
 } = usePdfReader();
 
 const minimize = () => appWindow.minimize();
@@ -121,6 +131,16 @@ const toggleFileMenu = (event: Event) => {
 const handleOpenFile = async () => {
   isFileMenuOpen.value = false;
   await openFile();
+};
+
+const handleExportText = async () => {
+  isFileMenuOpen.value = false;
+  await exportFullText();
+};
+
+const handleExportAudio = async () => {
+  isFileMenuOpen.value = false;
+  await exportFullAudio();
 };
 
 const toggleSidebar = (tab: 'transcript' | 'explain') => {
@@ -236,7 +256,7 @@ onUnmounted(() => window.removeEventListener('click', closeMenu));
 
 .dropdown-item:hover {
   background-color: var(--accent-light, #eff6ff);
-  color: var(--accent-color, #2563eb);
+  color: var(--accent-text, #2563eb);
 }
 
 .dropdown-separator {
@@ -303,7 +323,7 @@ onUnmounted(() => window.removeEventListener('click', closeMenu));
 .doc-page-badge {
   font-size: 11px;
   font-weight: 700;
-  color: var(--accent-color, #2563eb);
+  color: var(--accent-text, #2563eb);
   background: var(--accent-light, #eff6ff);
   padding: 1px 6px;
   border-radius: 6px;
@@ -361,13 +381,13 @@ onUnmounted(() => window.removeEventListener('click', closeMenu));
 
 .sidebar-toggle-btn:hover {
   border-color: #f59e0b;
-  color: #d97706;
+  color: var(--active-pill-text, #d97706);
 }
 
 .sidebar-toggle-btn.active {
-  background: #fef3c7;
+  background: var(--active-pill-bg, #fef3c7);
   border-color: #f59e0b;
-  color: #92400e;
+  color: var(--active-pill-text, #92400e);
 }
 
 .window-controls {

@@ -191,11 +191,12 @@ const handleDrop = async (e: DragEvent) => {
 .page-wrapper {
   position: relative;
   max-width: 98vw;
-  background: white;
+  background: var(--pdf-page-bg, #ffffff);
   box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.15), 0 8px 10px -6px rgba(0, 0, 0, 0.1);
   border-radius: 4px;
   margin: 0 auto 3rem auto;
-  transition: width 0.15s ease;
+  transition: width 0.15s ease, background-color 0.2s ease;
+  overflow: hidden;
 }
 
 .pdf-render-layer {
@@ -204,6 +205,8 @@ const handleDrop = async (e: DragEvent) => {
   left: 0;
   width: 100%;
   height: 100%;
+  filter: var(--pdf-filter, none);
+  transition: filter 0.2s ease;
 }
 
 :deep(.vue-pdf-embed canvas) {
@@ -249,7 +252,7 @@ const handleDrop = async (e: DragEvent) => {
   left: 0;
   right: 0;
   bottom: 0;
-  background: rgba(255, 255, 255, 0.85);
+  background: var(--overlay-bg, rgba(255, 255, 255, 0.85));
   display: flex;
   flex-direction: column;
   justify-content: center;
@@ -262,7 +265,7 @@ const handleDrop = async (e: DragEvent) => {
 .loading-spinner {
   width: 44px;
   height: 44px;
-  border: 4px solid #e2e8f0;
+  border: 4px solid var(--spinner-track, #e2e8f0);
   border-top-color: var(--accent-color, #2563eb);
   border-radius: 50%;
   animation: spin 0.8s linear infinite;

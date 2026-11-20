@@ -17,6 +17,7 @@ export interface SentenceBlock {
   text: string;
   cleanedText?: string;
   elementIndices: number[]; // Keeps track of which visual lines belong to this sentence
+  startsParagraph?: boolean;
 }
 
 export type ReadingMode = 'verbatim' | 'clean' | 'explanatory';
