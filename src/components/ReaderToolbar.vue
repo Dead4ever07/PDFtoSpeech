@@ -112,8 +112,18 @@
         <div class="setting-item">
           <span class="setting-label">Voice:</span>
           <select v-model="selectedVoice" class="select-input">
-            <option value="alba">Alba (UK Natural)</option>
-            <option value="joe">Joe (US Clear)</option>
+            <optgroup label="Kokoro Neural (Natural)">
+              <option value="kokoro_af_heart">Heart (US Natural)</option>
+              <option value="kokoro_af_bella">Bella (US Warm)</option>
+              <option value="kokoro_am_michael">Michael (US Male)</option>
+              <option value="kokoro_am_adam">Adam (US Crisp)</option>
+              <option value="kokoro_bf_emma">Emma (UK Natural)</option>
+              <option value="kokoro_bm_george">George (UK Male)</option>
+            </optgroup>
+            <optgroup label="Piper (Fast Fallback)">
+              <option value="alba">Alba (UK Fast)</option>
+              <option value="joe">Joe (US Fast)</option>
+            </optgroup>
           </select>
         </div>
 

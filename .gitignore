@@ -25,5 +25,6 @@ dist-ssr
 
 src-tauri/resources/piper/
 src-tauri/resources/model/
+src-tauri/resources/kokoro/
 *.so
 *.onnx

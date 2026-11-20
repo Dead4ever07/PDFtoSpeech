@@ -5,6 +5,16 @@ pub mod pdf_handler;
 pub fn run() {
     tauri::Builder::default()
         .manage(pdf_handler::PiperState::default())
+        .manage(pdf_handler::KokoroState::default())
+        .setup(|app| {
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(err) = pdf_handler::warmup_kokoro(&handle).await {
+                    eprintln!("Kokoro warmup skipped: {}", err);
+                }
+            });
+            Ok(())
+        })
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())

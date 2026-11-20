@@ -25,4 +25,8 @@ serde_json = "1"
 pdfium-render = "0.8.37"
 tauri-plugin-dialog = "2.6.0"
 tauri-plugin-fs = "2.4.5"
+ort = "=2.0.0-rc.12"
+ndarray = "0.17"
+bincode = "2.0"
+libloading = "0.7"
 

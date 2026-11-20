@@ -13,7 +13,7 @@ const currentPageIndex = ref<number>(0);
 const isLoading = ref<boolean>(false);
 const isPlaying = ref<boolean>(false);
 const isGeneratingAudio = ref<boolean>(false);
-const selectedVoice = ref<string>('alba');
+const selectedVoice = ref<string>('kokoro_af_heart');
 const speechSpeed = ref<number>(1.0);
 const zoomLevel = ref<number>(1.0);
 const theme = ref<AppTheme>('light');
@@ -67,6 +67,8 @@ export function cleanAcademicText(raw: string): string {
     .replace(/\(\s*\d{4}(?:,\s*\d{4})*\s*\)/g, '')
     // Remove raw URL references
     .replace(/https?:\/\/\S+/gi, '')
+    // Remove extra spaces left before punctuation after citation removal
+    .replace(/\s+([.,!?;:])/g, '$1')
     // Replace multiple spaces with a single space
     .replace(/\s+/g, ' ')
     .trim();
@@ -126,9 +128,9 @@ function splitLineIntoSegments(lineText: string): string[] {
 
 /**
  * Breaks a long text block into speakable chunks so TTS starts immediately
- * while subsequent chunks synthesize in the background.
+ * while subsequent chunks synthesize in the background, without chopping normal sentences.
  */
-function splitIntoSpeechChunks(text: string, maxChars: number = 180): string[] {
+function splitIntoSpeechChunks(text: string, maxChars: number = 240): string[] {
   const normalized = text.replace(/\s+/g, ' ').trim();
   if (!normalized) return [];
   if (normalized.length <= maxChars) return [normalized];

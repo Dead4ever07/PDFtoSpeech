@@ -1,13 +1,617 @@
 use crate::models::{PdfPageData, PdfTextElement};
+use bincode::{config::standard, decode_from_slice};
+use ndarray::Array;
+use ort::{
+    inputs,
+    session::{RunOptions, Session},
+    value::TensorRef,
+};
 use pdfium_render::prelude::*;
+use std::collections::HashMap;
+use std::ffi::{c_char, c_int, CStr, CString};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Manager};
 
 static AUDIO_REQ_COUNTER: AtomicU64 = AtomicU64::new(0);
+const KOKORO_SAMPLE_RATE: u32 = 24_000;
+const KOKORO_MAX_CLAUSE_CHARS: usize = 260;
+
+#[derive(Clone, Copy)]
+struct KokoroVoiceConfig {
+    pack_key: &'static str,
+    espeak_lang: &'static str,
+    is_british: bool,
+}
+
+fn map_kokoro_voice(voice_name: &str) -> Option<KokoroVoiceConfig> {
+    match voice_name {
+        "kokoro_af_heart" => Some(KokoroVoiceConfig {
+            pack_key: "af_heart",
+            espeak_lang: "en-us",
+            is_british: false,
+        }),
+        "kokoro_af_bella" => Some(KokoroVoiceConfig {
+            pack_key: "af_bella",
+            espeak_lang: "en-us",
+            is_british: false,
+        }),
+        "kokoro_am_michael" => Some(KokoroVoiceConfig {
+            pack_key: "am_michael",
+            espeak_lang: "en-us",
+            is_british: false,
+        }),
+        "kokoro_am_adam" => Some(KokoroVoiceConfig {
+            pack_key: "am_adam",
+            espeak_lang: "en-us",
+            is_british: false,
+        }),
+        "kokoro_bf_emma" => Some(KokoroVoiceConfig {
+            pack_key: "bf_emma",
+            espeak_lang: "en-gb-x-rp",
+            is_british: true,
+        }),
+        "kokoro_bm_george" => Some(KokoroVoiceConfig {
+            pack_key: "bm_george",
+            espeak_lang: "en-gb-x-rp",
+            is_british: true,
+        }),
+        _ => None,
+    }
+}
+
+type EspeakInitializeFn = unsafe extern "C" fn(c_int, c_int, *const c_char, c_int) -> c_int;
+type EspeakSetVoiceByNameFn = unsafe extern "C" fn(*const c_char) -> c_int;
+type EspeakTextToPhonemesFn =
+    unsafe extern "C" fn(*mut *const c_char, c_int, c_int) -> *const c_char;
+
+struct EspeakPhonemizer {
+    _lib: libloading::Library,
+    set_voice_by_name: EspeakSetVoiceByNameFn,
+    text_to_phonemes: EspeakTextToPhonemesFn,
+    active_lang: String,
+}
+
+// libloading::Library and function pointers are Send; access is serialized via Mutex.
+unsafe impl Send for EspeakPhonemizer {}
+
+impl EspeakPhonemizer {
+    fn load(lib_path: &Path, data_dir: &Path) -> Result<Self, String> {
+        let lib = unsafe {
+            libloading::Library::new(lib_path)
+                .map_err(|e| format!("Failed to load libespeak-ng: {}", e))?
+        };
+
+        let initialize: EspeakInitializeFn = unsafe {
+            *lib.get::<EspeakInitializeFn>(b"espeak_Initialize\0")
+                .map_err(|e| format!("Missing espeak_Initialize: {}", e))?
+        };
+        let set_voice_by_name: EspeakSetVoiceByNameFn = unsafe {
+            *lib.get::<EspeakSetVoiceByNameFn>(b"espeak_SetVoiceByName\0")
+                .map_err(|e| format!("Missing espeak_SetVoiceByName: {}", e))?
+        };
+        let text_to_phonemes: EspeakTextToPhonemesFn = unsafe {
+            *lib.get::<EspeakTextToPhonemesFn>(b"espeak_TextToPhonemes\0")
+                .map_err(|e| format!("Missing espeak_TextToPhonemes: {}", e))?
+        };
+
+        let data_cstr = CString::new(
+            data_dir
+                .to_str()
+                .ok_or("Invalid espeak-ng-data directory path")?,
+        )
+        .map_err(|e| e.to_string())?;
+
+        // 2 = AUDIO_OUTPUT_SYNCHRONOUS
+        let rc = unsafe { initialize(2, 0, data_cstr.as_ptr(), 0) };
+        if rc < 0 {
+            return Err(format!("espeak_Initialize failed with code {}", rc));
+        }
+
+        let mut instance = Self {
+            _lib: lib,
+            set_voice_by_name,
+            text_to_phonemes,
+            active_lang: String::new(),
+        };
+        instance.set_language("en-us")?;
+        Ok(instance)
+    }
+
+    fn set_language(&mut self, lang: &str) -> Result<(), String> {
+        if self.active_lang == lang {
+            return Ok(());
+        }
+        let lang_cstr = CString::new(lang).map_err(|e| e.to_string())?;
+        let rc = unsafe { (self.set_voice_by_name)(lang_cstr.as_ptr()) };
+        if rc != 0 {
+            return Err(format!("espeak_SetVoiceByName({}) failed: {}", lang, rc));
+        }
+        self.active_lang = lang.to_string();
+        Ok(())
+    }
+
+    fn phonemize_clause(&mut self, clause: &str, lang: &str) -> Result<String, String> {
+        self.set_language(lang)?;
+        let sanitized = clause.replace('\0', " ");
+        let cstr = CString::new(sanitized).map_err(|e| e.to_string())?;
+        let mut ptr = cstr.as_ptr();
+        let mut out = String::new();
+
+        // textmode = 1 (UTF-8), phonememode = 2 (IPA)
+        while !ptr.is_null() {
+            let ph_ptr = unsafe { (self.text_to_phonemes)(&mut ptr, 1, 2) };
+            if ph_ptr.is_null() {
+                break;
+            }
+            let ph = unsafe { CStr::from_ptr(ph_ptr) }.to_string_lossy();
+            let trimmed = ph.trim();
+            if !trimmed.is_empty() {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(trimmed);
+            }
+        }
+        Ok(out)
+    }
+}
+
+pub struct KokoroEngine {
+    session: tauri::async_runtime::Mutex<Session>,
+    voices: HashMap<String, Vec<Vec<Vec<f32>>>>,
+    espeak: Mutex<EspeakPhonemizer>,
+}
+
+#[derive(Default)]
+pub struct KokoroState {
+    engine: tauri::async_runtime::Mutex<Option<Arc<KokoroEngine>>>,
+}
+
+fn split_clauses_with_punct(text: &str) -> Vec<(String, Option<char>)> {
+    let clean = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if clean.is_empty() {
+        return Vec::new();
+    }
+
+    let bytes = clean.as_bytes();
+    let mut result = Vec::new();
+    let mut start = 0;
+
+    for (idx, ch) in clean.char_indices() {
+        if !matches!(ch, ',' | ';' | ':' | '.' | '!' | '?' | '—' | '…') {
+            continue;
+        }
+        let next_idx = idx + ch.len_utf8();
+        let next_is_boundary = next_idx >= clean.len()
+            || clean[next_idx..]
+                .chars()
+                .next()
+                .map(|c| c.is_whitespace())
+                .unwrap_or(true);
+
+        if !next_is_boundary {
+            // Keep decimals like 3.14 or URLs inside the clause
+            continue;
+        }
+
+        if ch == '.' {
+            // Keep common abbreviations attached to the surrounding phrase for natural reading
+            let before = clean[start..idx].trim_end();
+            let last_word = before.rsplit(|c: char| c.is_whitespace()).next().unwrap_or("");
+            let lower = last_word.to_ascii_lowercase();
+            let is_abbrev = matches!(
+                lower.as_str(),
+                "dr" | "mr" | "mrs" | "ms" | "prof" | "fig" | "figs" | "eq" | "eqs"
+                    | "vol" | "no" | "pp" | "st" | "vs" | "cf" | "al" | "e.g" | "i.e"
+            ) || (last_word.len() == 1 && last_word.chars().all(|c| c.is_ascii_alphabetic()));
+            if is_abbrev && next_idx < clean.len() {
+                continue;
+            }
+        }
+
+        let clause = clean[start..idx].trim().to_string();
+        if !clause.is_empty() {
+            result.push((clause, Some(ch)));
+        }
+        start = next_idx;
+        while start < bytes.len() && bytes[start].is_ascii_whitespace() {
+            start += 1;
+        }
+    }
+
+    if start < clean.len() {
+        let tail = clean[start..].trim().to_string();
+        if !tail.is_empty() {
+            result.push((tail, None));
+        }
+    }
+
+    result
+}
+
+fn espeak_ipa_to_misaki(ipa: &str, is_british: bool) -> String {
+    let mut mapped = ipa
+        .replace('\u{0303}', "")
+        .replace("aɪ", "I")
+        .replace("aʊ", "W")
+        .replace("eɪ", "A")
+        .replace("oʊ", "O")
+        .replace("əʊ", "Q")
+        .replace("ɔɪ", "Y")
+        .replace("tʃ", "ʧ")
+        .replace("dʒ", "ʤ")
+        .replace("əl", "ᵊl")
+        .replace("ɚ", "əɹ")
+        .replace('r', "ɹ")
+        .replace('x', "k")
+        .replace('ç', "k")
+        .replace('ɐ', "ə")
+        .replace('ɬ', "l")
+        .replace('ʔ', "t")
+        .replace('ʲ', "");
+
+    if is_british {
+        mapped = mapped.replace("eə", "ɛː");
+    }
+    mapped
+}
+
+fn kokoro_vocab_id(ch: char) -> Option<i64> {
+    let id = match ch {
+        ';' => 1,
+        ':' => 2,
+        ',' => 3,
+        '.' => 4,
+        '!' => 5,
+        '?' => 6,
+        '—' => 9,
+        '…' => 10,
+        '"' => 11,
+        '(' => 12,
+        ')' => 13,
+        '“' => 14,
+        '”' => 15,
+        ' ' => 16,
+        '\u{0303}' => 17,
+        'ʣ' => 18,
+        'ʥ' => 19,
+        'ʦ' => 20,
+        'ʨ' => 21,
+        'ᵝ' => 22,
+        '\u{AB67}' => 23,
+        'A' => 24,
+        'I' => 25,
+        'O' => 31,
+        'Q' => 33,
+        'S' => 35,
+        'T' => 36,
+        'W' => 39,
+        'Y' => 41,
+        'ᵊ' => 42,
+        'a' => 43,
+        'b' => 44,
+        'c' => 45,
+        'd' => 46,
+        'e' => 47,
+        'f' => 48,
+        'h' => 50,
+        'i' => 51,
+        'j' => 52,
+        'k' => 53,
+        'l' => 54,
+        'm' => 55,
+        'n' => 56,
+        'o' => 57,
+        'p' => 58,
+        'q' => 59,
+        'r' => 60,
+        's' => 61,
+        't' => 62,
+        'u' => 63,
+        'v' => 64,
+        'w' => 65,
+        'x' => 66,
+        'y' => 67,
+        'z' => 68,
+        'ɑ' => 69,
+        'ɐ' => 70,
+        'ɒ' => 71,
+        'æ' => 72,
+        'β' => 75,
+        'ɔ' => 76,
+        'ɕ' => 77,
+        'ç' => 78,
+        'ɖ' => 80,
+        'ð' => 81,
+        'ʤ' => 82,
+        'ə' => 83,
+        'ɚ' => 85,
+        'ɛ' => 86,
+        'ɜ' => 87,
+        'ɟ' => 90,
+        'ɡ' => 92,
+        'ɥ' => 99,
+        'ɨ' => 101,
+        'ɪ' => 102,
+        'ʝ' => 103,
+        'ɯ' => 110,
+        'ɰ' => 111,
+        'ŋ' => 112,
+        'ɳ' => 113,
+        'ɲ' => 114,
+        'ɴ' => 115,
+        'ø' => 116,
+        'ɸ' => 118,
+        'θ' => 119,
+        'œ' => 120,
+        'ɹ' => 123,
+        'ɾ' => 125,
+        'ɻ' => 126,
+        'ʁ' => 128,
+        'ɽ' => 129,
+        'ʂ' => 130,
+        'ʃ' => 131,
+        'ʈ' => 132,
+        'ʧ' => 133,
+        'ʊ' => 135,
+        'ʋ' => 136,
+        'ʌ' => 138,
+        'ɣ' => 139,
+        'ɤ' => 140,
+        'χ' => 142,
+        'ʎ' => 143,
+        'ʒ' => 147,
+        'ʔ' => 148,
+        'ˈ' => 156,
+        'ˌ' => 157,
+        'ː' => 158,
+        'ʰ' => 162,
+        'ʲ' => 164,
+        '↓' => 169,
+        '→' => 171,
+        '↗' => 172,
+        '↘' => 173,
+        'ᵻ' => 177,
+        _ => return None,
+    };
+    Some(id)
+}
+
+fn phonemes_to_token_ids(phonemes: &str) -> Vec<i64> {
+    let mut tokens = Vec::with_capacity(phonemes.len() + 2);
+    tokens.push(0);
+    for ch in phonemes.chars() {
+        if let Some(id) = kokoro_vocab_id(ch) {
+            tokens.push(id);
+        }
+    }
+    tokens.push(0);
+    tokens
+}
+
+impl KokoroEngine {
+    fn load_from_paths(
+        model_path: &Path,
+        voices_path: &Path,
+        espeak_lib_path: &Path,
+        espeak_data_dir: &Path,
+    ) -> Result<Self, String> {
+        let voices_bytes =
+            std::fs::read(voices_path).map_err(|e| format!("Failed to read voices.bin: {}", e))?;
+        let (voices, _): (HashMap<String, Vec<Vec<Vec<f32>>>>, usize) =
+            decode_from_slice(&voices_bytes, standard())
+                .map_err(|e| format!("Failed to decode voices.bin: {}", e))?;
+
+        let session = Session::builder()
+            .map_err(|e| format!("Failed to create ORT session builder: {}", e))?
+            .commit_from_file(model_path)
+            .map_err(|e| format!("Failed to load Kokoro ONNX model: {}", e))?;
+
+        let espeak = EspeakPhonemizer::load(espeak_lib_path, espeak_data_dir)?;
+
+        Ok(Self {
+            session: tauri::async_runtime::Mutex::new(session),
+            voices,
+            espeak: Mutex::new(espeak),
+        })
+    }
+
+    fn text_to_phonemes(&self, text: &str, cfg: KokoroVoiceConfig) -> Result<String, String> {
+        let clauses = split_clauses_with_punct(text);
+        if clauses.is_empty() {
+            return Ok(String::new());
+        }
+
+        let mut espeak = self
+            .espeak
+            .lock()
+            .map_err(|_| "eSpeak phonemizer lock poisoned".to_string())?;
+        let mut combined = String::new();
+
+        for (clause, punct) in clauses {
+            let ipa = espeak.phonemize_clause(&clause, cfg.espeak_lang)?;
+            let misaki = espeak_ipa_to_misaki(&ipa, cfg.is_british);
+            if !misaki.is_empty() {
+                if !combined.is_empty() {
+                    combined.push(' ');
+                }
+                combined.push_str(&misaki);
+                if let Some(p) = punct {
+                    combined.push(p);
+                }
+            }
+        }
+        Ok(combined)
+    }
+
+    async fn synthesize_text(&self, text: &str, cfg: KokoroVoiceConfig) -> Result<Vec<f32>, String> {
+        let pack = self
+            .voices
+            .get(cfg.pack_key)
+            .ok_or_else(|| format!("Voice pack '{}' not found in voices.bin", cfg.pack_key))?;
+
+        let chunks = split_kokoro_segments(text, KOKORO_MAX_CLAUSE_CHARS);
+        let mut all_samples = Vec::new();
+
+        for chunk in chunks {
+            let phonemes = self.text_to_phonemes(&chunk, cfg)?;
+            let mut token_ids = phonemes_to_token_ids(&phonemes);
+            if token_ids.len() <= 2 {
+                continue;
+            }
+            if token_ids.len() > pack.len() {
+                token_ids.truncate(pack.len() - 1);
+                token_ids.push(0);
+            }
+
+            let ref_s = pack[token_ids.len() - 1]
+                .first()
+                .cloned()
+                .ok_or("Empty voice style vector")?;
+
+            let tokens_arr = Array::from_shape_vec((1, token_ids.len()), token_ids)
+                .map_err(|e| format!("Invalid token tensor shape: {}", e))?;
+            let style_arr = Array::from_shape_vec((1, ref_s.len()), ref_s)
+                .map_err(|e| format!("Invalid style tensor shape: {}", e))?;
+            let speed_arr = Array::from_vec(vec![1.0f32]);
+
+            let options = RunOptions::new().map_err(|e| e.to_string())?;
+            let mut session = self.session.lock().await;
+            let outputs = session
+                .run_async(
+                    inputs![
+                        "tokens" => TensorRef::from_array_view(&tokens_arr).map_err(|e| e.to_string())?,
+                        "style" => TensorRef::from_array_view(&style_arr).map_err(|e| e.to_string())?,
+                        "speed" => TensorRef::from_array_view(&speed_arr).map_err(|e| e.to_string())?,
+                    ],
+                    &options,
+                )
+                .map_err(|e| format!("Kokoro inference failed: {}", e))?
+                .await
+                .map_err(|e| format!("Kokoro async inference failed: {}", e))?;
+
+            let (_, audio) = outputs["audio"]
+                .try_extract_tensor::<f32>()
+                .map_err(|e| format!("Failed to extract Kokoro audio tensor: {}", e))?;
+            all_samples.extend_from_slice(audio);
+        }
+
+        Ok(all_samples)
+    }
+}
+
+async fn get_or_init_kokoro(app: &AppHandle) -> Result<Arc<KokoroEngine>, String> {
+    let state = app.state::<KokoroState>();
+    let mut guard = state.engine.lock().await;
+    if let Some(engine) = guard.as_ref() {
+        return Ok(Arc::clone(engine));
+    }
+
+    let model_path = app
+        .path()
+        .resolve(
+            "resources/kokoro/kokoro-v1.0.int8.onnx",
+            tauri::path::BaseDirectory::Resource,
+        )
+        .map_err(|e| format!("Could not resolve Kokoro model path: {}", e))?;
+
+    let voices_path = app
+        .path()
+        .resolve(
+            "resources/kokoro/voices.bin",
+            tauri::path::BaseDirectory::Resource,
+        )
+        .map_err(|e| format!("Could not resolve Kokoro voices path: {}", e))?;
+
+    let espeak_lib_path = app
+        .path()
+        .resolve(
+            "resources/piper/libespeak-ng.so.1",
+            tauri::path::BaseDirectory::Resource,
+        )
+        .map_err(|e| format!("Could not resolve libespeak-ng path: {}", e))?;
+
+    let espeak_data_dir = app
+        .path()
+        .resolve(
+            "resources/piper/espeak-ng-data",
+            tauri::path::BaseDirectory::Resource,
+        )
+        .map_err(|e| format!("Could not resolve espeak-ng-data path: {}", e))?;
+
+    if !model_path.exists() || !voices_path.exists() {
+        return Err("Kokoro model assets not found in resources/kokoro".to_string());
+    }
+
+    let engine = tauri::async_runtime::spawn_blocking(move || {
+        KokoroEngine::load_from_paths(&model_path, &voices_path, &espeak_lib_path, &espeak_data_dir)
+    })
+    .await
+    .map_err(|e| format!("Kokoro init task failed: {}", e))??;
+
+    let engine = Arc::new(engine);
+    *guard = Some(Arc::clone(&engine));
+    Ok(engine)
+}
+
+pub async fn warmup_kokoro(app: &AppHandle) -> Result<(), String> {
+    let _ = get_or_init_kokoro(app).await?;
+    Ok(())
+}
+
+fn split_kokoro_segments(text: &str, max_chars: usize) -> Vec<String> {
+    let clean = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if clean.is_empty() {
+        return Vec::new();
+    }
+    if clean.len() <= max_chars {
+        return vec![clean];
+    }
+
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    for word in clean.split(' ') {
+        if !current.is_empty() && current.len() + 1 + word.len() > max_chars {
+            segments.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+fn encode_wav_pcm16(samples: &[f32], sample_rate: u32) -> Vec<u8> {
+    let data_len = (samples.len() * 2) as u32;
+    let mut buf = Vec::with_capacity(44 + data_len as usize);
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&(36 + data_len).to_le_bytes());
+    buf.extend_from_slice(b"WAVEfmt ");
+    buf.extend_from_slice(&16u32.to_le_bytes());
+    buf.extend_from_slice(&1u16.to_le_bytes());
+    buf.extend_from_slice(&1u16.to_le_bytes());
+    buf.extend_from_slice(&sample_rate.to_le_bytes());
+    buf.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+    buf.extend_from_slice(&2u16.to_le_bytes());
+    buf.extend_from_slice(&16u16.to_le_bytes());
+    buf.extend_from_slice(b"data");
+    buf.extend_from_slice(&data_len.to_le_bytes());
+
+    for &sample in samples {
+        let clamped = sample.clamp(-1.0, 1.0);
+        let pcm = (clamped * 32767.0) as i16;
+        buf.extend_from_slice(&pcm.to_le_bytes());
+    }
+    buf
+}
 
 struct PiperWorker {
     voice_name: String,
@@ -78,6 +682,8 @@ impl PiperWorker {
                 model_path.to_str().ok_or("Invalid model path")?,
                 "--config",
                 config_path.to_str().ok_or("Invalid config path")?,
+                "--sentence_silence",
+                "0.05",
                 "--json-input",
                 "--output_dir",
                 temp_dir.to_str().ok_or("Invalid temp dir")?,
@@ -139,6 +745,21 @@ pub async fn parse_pdf(app: AppHandle, path: String) -> Result<Vec<PdfPageData>,
         .map_err(|e| format!("PDF parsing task failed: {}", e))?
 }
 
+struct RawPdfWord {
+    el: PdfTextElement,
+    had_leading_ws: bool,
+    had_trailing_ws: bool,
+}
+
+fn normalize_pdf_text(raw: &str) -> String {
+    raw.replace('\u{00A0}', " ")
+        .replace('ﬀ', "ff")
+        .replace('ﬁ', "fi")
+        .replace('ﬂ', "fl")
+        .replace('ﬃ', "ffi")
+        .replace('ﬄ', "ffl")
+}
+
 fn parse_pdf_sync(app: &AppHandle, path: &str) -> Result<Vec<PdfPageData>, String> {
     println!("Loading the library");
 
@@ -173,40 +794,58 @@ fn parse_pdf_sync(app: &AppHandle, path: &str) -> Result<Vec<PdfPageData>, Strin
         // 1. Collect all valid words on the page
         for object in page.objects().iter() {
             if let Some(text_object) = object.as_text_object() {
-                let raw_text = text_object.text();
-                if raw_text.chars().any(|c| c.is_alphanumeric()) {
+                let normalized = normalize_pdf_text(&text_object.text());
+                if normalized.chars().any(|c| c.is_alphanumeric()) {
                     if let Ok(bounds) = text_object.bounds() {
-                        raw_elements.push(PdfTextElement {
-                            text: raw_text.trim().to_string(),
-                            x: bounds.left().value,
-                            y: page.height().value - bounds.top().value,
-                            width: bounds.width().value,
-                            height: bounds.height().value,
+                        let had_leading_ws = normalized
+                            .chars()
+                            .next()
+                            .map(|c| c.is_whitespace())
+                            .unwrap_or(false);
+                        let had_trailing_ws = normalized
+                            .chars()
+                            .last()
+                            .map(|c| c.is_whitespace())
+                            .unwrap_or(false);
+                        raw_elements.push(RawPdfWord {
+                            el: PdfTextElement {
+                                text: normalized.trim().to_string(),
+                                x: bounds.left().value,
+                                y: page.height().value - bounds.top().value,
+                                width: bounds.width().value,
+                                height: bounds.height().value,
+                            },
+                            had_leading_ws,
+                            had_trailing_ws,
                         });
                     }
                 }
             }
         }
 
-        raw_elements.sort_by(|a, b| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal));
+        raw_elements.sort_by(|a, b| {
+            a.el.y
+                .partial_cmp(&b.el.y)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         let mut line_elements = Vec::new();
-        let mut current_line: Vec<PdfTextElement> = Vec::new();
+        let mut current_line: Vec<RawPdfWord> = Vec::new();
         let y_tolerance = 5.0; // Margin of error for words on the same line
 
         // 3. Group words into lines
-        for el in raw_elements {
+        for item in raw_elements {
             if current_line.is_empty() {
-                current_line.push(el);
+                current_line.push(item);
             } else {
-                let baseline_y = current_line[0].y;
+                let baseline_y = current_line[0].el.y;
                 // If the word is on the same vertical level
-                if (el.y - baseline_y).abs() <= y_tolerance {
-                    current_line.push(el);
+                if (item.el.y - baseline_y).abs() <= y_tolerance {
+                    current_line.push(item);
                 } else {
                     // Merge the current line and start a new one
                     line_elements.push(merge_line_elements(&mut current_line));
-                    current_line.push(el);
+                    current_line.push(item);
                 }
             }
         }
@@ -219,7 +858,7 @@ fn parse_pdf_sync(app: &AppHandle, path: &str) -> Result<Vec<PdfPageData>, Strin
             page_number: index as u16 + 1,
             width: page.width().value,
             height: page.height().value,
-            elements: line_elements, // ⬅️ We now send merged lines instead of individual words!
+            elements: line_elements,
         });
     }
     println!("Data sent to the front end");
@@ -227,25 +866,55 @@ fn parse_pdf_sync(app: &AppHandle, path: &str) -> Result<Vec<PdfPageData>, Strin
 }
 
 // Helper function to merge an array of words into a single line bounding box
-fn merge_line_elements(line: &mut Vec<PdfTextElement>) -> PdfTextElement {
+fn merge_line_elements(line: &mut Vec<RawPdfWord>) -> PdfTextElement {
     // Sort words left-to-right
-    line.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
-    let first = line.first().unwrap();
-    let last = line.last().unwrap();
+    line.sort_by(|a, b| {
+        a.el.x
+            .partial_cmp(&b.el.x)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let first = &line.first().unwrap().el;
+    let last = &line.last().unwrap().el;
 
     let min_x = first.x;
     let max_x = last.x + last.width; // The far right edge of the last word
 
     // Find the highest top edge and tallest height in the line
-    let max_y = line.iter().map(|e| e.y).fold(f32::MIN, f32::max);
-    let max_height = line.iter().map(|e| e.height).fold(f32::MIN, f32::max);
+    let max_y = line.iter().map(|w| w.el.y).fold(f32::MIN, f32::max);
+    let max_height = line.iter().map(|w| w.el.height).fold(f32::MIN, f32::max);
 
-    // Combine all the text with spaces
-    let combined_text = line
-        .iter()
-        .map(|e| e.text.as_str())
-        .collect::<Vec<&str>>()
-        .join(" ");
+    // Combine text objects, preserving spaces from whitespace or horizontal gaps
+    let mut combined_text = String::new();
+    let mut prev_end_x: Option<f32> = None;
+    let mut prev_height: f32 = 10.0;
+    let mut prev_had_trailing = false;
+
+    for w in line.iter() {
+        if let Some(end_x) = prev_end_x {
+            let gap = w.el.x - end_x;
+            let starts_with_punct = w
+                .el
+                .text
+                .chars()
+                .next()
+                .map(|c| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']'))
+                .unwrap_or(false);
+            let threshold = if starts_with_punct {
+                prev_height * 0.2
+            } else {
+                prev_height * 0.05
+            };
+            if prev_had_trailing || w.had_leading_ws || gap > threshold {
+                combined_text.push(' ');
+            }
+        }
+        combined_text.push_str(&w.el.text);
+        prev_end_x = Some(w.el.x + w.el.width);
+        if w.el.height > 0.0 {
+            prev_height = w.el.height;
+        }
+        prev_had_trailing = w.had_trailing_ws;
+    }
 
     let merged = PdfTextElement {
         text: combined_text,
@@ -265,6 +934,13 @@ pub async fn generate_audio(
     text: String,
     voice_name: String,
 ) -> Result<tauri::ipc::Response, String> {
+    if let Some(voice_cfg) = map_kokoro_voice(&voice_name) {
+        let engine = get_or_init_kokoro(&app).await?;
+        let samples = engine.synthesize_text(&text, voice_cfg).await?;
+        let wav_bytes = encode_wav_pcm16(&samples, KOKORO_SAMPLE_RATE);
+        return Ok(tauri::ipc::Response::new(wav_bytes));
+    }
+
     let audio_bytes = tauri::async_runtime::spawn_blocking(move || {
         let temp_dir = app.path().temp_dir().map_err(|e| e.to_string())?;
         std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
@@ -305,4 +981,87 @@ pub async fn generate_audio(
     .map_err(|e| format!("Audio synthesis task failed: {}", e))??;
 
     Ok(tauri::ipc::Response::new(audio_bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kokoro_runtime_synthesis_produces_wav() {
+        let model_path = Path::new("resources/kokoro/kokoro-v1.0.int8.onnx");
+        let voices_path = Path::new("resources/kokoro/voices.bin");
+        let espeak_lib = Path::new("resources/piper/libespeak-ng.so.1");
+        let espeak_data = Path::new("resources/piper/espeak-ng-data");
+        if !model_path.exists() || !voices_path.exists() || !espeak_lib.exists() {
+            return;
+        }
+
+        let engine = KokoroEngine::load_from_paths(model_path, voices_path, espeak_lib, espeak_data)
+            .expect("KokoroEngine::load_from_paths should succeed");
+
+        let cfg = map_kokoro_voice("kokoro_af_heart").unwrap();
+        let sample_text =
+            "In 2024, we don't misspell IT, AI, PDF, or experimental results.";
+        let phonemes = engine
+            .text_to_phonemes(sample_text, cfg)
+            .expect("phonemization should succeed");
+        println!("US Misaki phonemes: {}", phonemes);
+        assert!(!phonemes.is_empty());
+
+        let uk_cfg = map_kokoro_voice("kokoro_bf_emma").unwrap();
+        let uk_phonemes = engine
+            .text_to_phonemes("Hello world! Water bath car.", uk_cfg)
+            .expect("UK phonemization should succeed");
+        println!("UK Misaki phonemes: {}", uk_phonemes);
+        assert!(uk_phonemes.contains('Q'));
+
+        let t0 = std::time::Instant::now();
+        let samples = tauri::async_runtime::block_on(engine.synthesize_text(sample_text, cfg))
+            .expect("Kokoro synthesis should succeed");
+        let elapsed = t0.elapsed();
+
+        assert!(!samples.is_empty(), "Kokoro returned empty audio");
+        let wav = encode_wav_pcm16(&samples, KOKORO_SAMPLE_RATE);
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        println!(
+            "Kokoro test: {} samples ({:.2}s audio) synthesized in {:?}",
+            samples.len(),
+            samples.len() as f32 / KOKORO_SAMPLE_RATE as f32,
+            elapsed
+        );
+    }
+
+    #[test]
+    fn merge_line_preserves_spaces_and_ligatures() {
+        let mut words = vec![
+            RawPdfWord {
+                el: PdfTextElement {
+                    text: normalize_pdf_text("ﬁrst "),
+                    x: 10.0,
+                    y: 100.0,
+                    width: 30.0,
+                    height: 10.0,
+                },
+                had_leading_ws: false,
+                had_trailing_ws: true,
+            },
+            RawPdfWord {
+                el: PdfTextElement {
+                    text: "result".to_string(),
+                    x: 40.0, // gap == 0 due to trailing space width inside bounds
+                    y: 100.0,
+                    width: 30.0,
+                    height: 10.0,
+                },
+                had_leading_ws: false,
+                had_trailing_ws: false,
+            },
+        ];
+        // Re-trim as parse_pdf_sync does
+        words[0].el.text = words[0].el.text.trim().to_string();
+        let merged = merge_line_elements(&mut words);
+        assert_eq!(merged.text, "first result");
+    }
 }

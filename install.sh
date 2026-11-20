@@ -288,6 +288,7 @@ RESOURCES_DIR="src-tauri/resources"
 mkdir -p "$RESOURCES_DIR/piper"
 mkdir -p "$RESOURCES_DIR/models/alba"
 mkdir -p "$RESOURCES_DIR/models/joe"
+mkdir -p "$RESOURCES_DIR/kokoro"
 
 # 1. libpdfium.so
 PDFIUM_SO="$RESOURCES_DIR/libpdfium.so"
@@ -342,6 +343,23 @@ if [ ! -s "$JOE_ONNX" ]; then
 fi
 log_info "Voice model Joe: OK"
 
+# 5. Kokoro-82M INT8 ONNX model and voices bundle
+KOKORO_ONNX="$RESOURCES_DIR/kokoro/kokoro-v1.0.int8.onnx"
+if [ ! -s "$KOKORO_ONNX" ]; then
+  log_info "Downloading Kokoro v1.0 INT8 ONNX model..."
+  KOKORO_URL="https://github.com/mzdk100/kokoro/releases/download/V1.0/kokoro-v1.0.int8.onnx"
+  curl -sSL "$KOKORO_URL" -o "$KOKORO_ONNX"
+fi
+log_info "Kokoro INT8 model: OK"
+
+KOKORO_VOICES="$RESOURCES_DIR/kokoro/voices.bin"
+if [ ! -s "$KOKORO_VOICES" ]; then
+  log_info "Downloading Kokoro voices bundle..."
+  KOKORO_VOICES_URL="https://github.com/mzdk100/kokoro/releases/download/V1.0/voices.bin"
+  curl -sSL "$KOKORO_VOICES_URL" -o "$KOKORO_VOICES"
+fi
+log_info "Kokoro voices bundle: OK"
+
 # ==============================================================================
 # Step 5: Install Project Dependencies
 # ==============================================================================
@@ -387,7 +405,7 @@ DEB_PKG=$(find src-tauri/target/release/bundle/deb -name "*.deb" 2>/dev/null | h
 if [ "$INSTALL_MODE" != "user" ] && [ -n "$DEB_PKG" ] && [ -f "$DEB_PKG" ] && has_sudo; then
   log_info "Installing via Debian package: $DEB_PKG"
   if command -v apt-get >/dev/null 2>&1; then
-    run_root apt-get install -y "$DEB_PKG" || run_root dpkg -i "$DEB_PKG"
+    run_root apt-get install --reinstall -y "$DEB_PKG" || run_root dpkg -i "$DEB_PKG"
   else
     run_root dpkg -i "$DEB_PKG"
   fi
