@@ -1,3 +1,7 @@
+use crate::layout_detector::{
+    get_or_init_layout_detector, intersection_ratio, xy_cut_sort, LayoutBox, RegionAction,
+    RegionRect, LAYOUT_INPUT_SIZE,
+};
 use crate::models::{PdfPageData, PdfTextElement};
 use bincode::{config::standard, decode_from_slice};
 use ndarray::Array;
@@ -771,6 +775,183 @@ fn normalize_pdf_text(raw: &str) -> String {
         .replace('ﬄ', "ffl")
 }
 
+fn group_words_into_lines(
+    mut words: Vec<RawPdfWord>,
+    layout_label: Option<String>,
+    is_filtered: bool,
+) -> Vec<PdfTextElement> {
+    words.sort_by(|a, b| {
+        a.el.y
+            .partial_cmp(&b.el.y)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.el.x.partial_cmp(&b.el.x).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    let mut lines = Vec::new();
+    let mut current_line: Vec<RawPdfWord> = Vec::new();
+    let y_tolerance = 5.0;
+
+    for item in words {
+        if current_line.is_empty() {
+            current_line.push(item);
+        } else {
+            let baseline_y = current_line[0].el.y;
+            if (item.el.y - baseline_y).abs() <= y_tolerance {
+                current_line.push(item);
+            } else {
+                lines.push(merge_line_elements(
+                    &mut current_line,
+                    layout_label.clone(),
+                    is_filtered,
+                ));
+                current_line.push(item);
+            }
+        }
+    }
+
+    if !current_line.is_empty() {
+        lines.push(merge_line_elements(
+            &mut current_line,
+            layout_label,
+            is_filtered,
+        ));
+    }
+
+    lines
+}
+
+fn process_page_with_layout(
+    raw_elements: Vec<RawPdfWord>,
+    boxes: &[LayoutBox],
+) -> Vec<PdfTextElement> {
+    if boxes.is_empty() {
+        return group_words_into_lines(raw_elements, None, false);
+    }
+
+    let keep_boxes: Vec<&LayoutBox> = boxes
+        .iter()
+        .filter(|b| b.action == RegionAction::Keep)
+        .collect();
+    let drop_boxes: Vec<&LayoutBox> = boxes
+        .iter()
+        .filter(|b| b.action == RegionAction::Drop)
+        .collect();
+
+    let mut keep_buckets: Vec<Vec<RawPdfWord>> = (0..keep_boxes.len()).map(|_| Vec::new()).collect();
+    let mut unassigned: Vec<RawPdfWord> = Vec::new();
+    let mut filtered_buckets: HashMap<&'static str, Vec<RawPdfWord>> = HashMap::new();
+
+    for word in raw_elements {
+        let wx1 = word.el.x;
+        let wy1 = word.el.y;
+        let wx2 = wx1 + word.el.width.max(0.5);
+        let wy2 = wy1 + word.el.height.max(0.5);
+        let cx = 0.5 * (wx1 + wx2);
+        let cy = 0.5 * (wy1 + wy2);
+
+        let mut best_keep: Option<(usize, f32)> = None;
+        for (idx, kb) in keep_boxes.iter().enumerate() {
+            let ratio = intersection_ratio(wx1, wy1, wx2, wy2, kb);
+            let center_in = cx >= kb.x1 && cx <= kb.x2 && cy >= kb.y1 && cy <= kb.y2;
+            let eff = if center_in { ratio.max(0.5) } else { ratio };
+            if eff > 0.20 && best_keep.map(|(_, b)| eff > b).unwrap_or(true) {
+                best_keep = Some((idx, eff));
+            }
+        }
+
+        let mut best_drop: Option<(&'static str, f32)> = None;
+        for db in drop_boxes.iter() {
+            let ratio = intersection_ratio(wx1, wy1, wx2, wy2, db);
+            let center_in = cx >= db.x1 && cx <= db.x2 && cy >= db.y1 && cy <= db.y2;
+            let eff = if center_in { ratio.max(0.5) } else { ratio };
+            if eff >= 0.35 && best_drop.map(|(_, b)| eff > b).unwrap_or(true) {
+                best_drop = Some((db.label, eff));
+            }
+        }
+
+        let keep_score = best_keep.map(|(_, s)| s).unwrap_or(0.0);
+        if let Some((drop_label, drop_score)) = best_drop {
+            if drop_score > keep_score * 0.85 {
+                filtered_buckets.entry(drop_label).or_default().push(word);
+                continue;
+            }
+        }
+
+        if let Some((keep_idx, _)) = best_keep {
+            keep_buckets[keep_idx].push(word);
+        } else {
+            unassigned.push(word);
+        }
+    }
+
+    // Build region list (detected Keep boxes + synthetic regions for unassigned words) for XY-cut reading order
+    let mut region_items: Vec<(Option<String>, Vec<RawPdfWord>, RegionRect)> = Vec::new();
+    for (idx, bucket) in keep_buckets.into_iter().enumerate() {
+        if bucket.is_empty() {
+            continue;
+        }
+        let kb = keep_boxes[idx];
+        let r_idx = region_items.len();
+        region_items.push((
+            Some(kb.label.to_string()),
+            bucket,
+            RegionRect {
+                index: r_idx,
+                x1: kb.x1,
+                y1: kb.y1,
+                x2: kb.x2,
+                y2: kb.y2,
+            },
+        ));
+    }
+
+    for line_el in group_words_into_lines(unassigned, None, false) {
+        let r_idx = region_items.len();
+        let rect = RegionRect {
+            index: r_idx,
+            x1: line_el.x,
+            y1: line_el.y,
+            x2: line_el.x + line_el.width,
+            y2: line_el.y + line_el.height,
+        };
+        region_items.push((
+            None,
+            vec![RawPdfWord {
+                el: line_el,
+                had_leading_ws: false,
+                had_trailing_ws: false,
+            }],
+            rect,
+        ));
+    }
+
+    let mut rects: Vec<RegionRect> = region_items.iter().map(|(_, _, r)| *r).collect();
+    xy_cut_sort(&mut rects);
+
+    let mut ordered_lines = Vec::new();
+    for rect in rects {
+        let (label, words, _) = &mut region_items[rect.index];
+        if words.len() == 1 && label.is_none() {
+            // Already merged unassigned line
+            ordered_lines.push(words.pop().unwrap().el);
+        } else {
+            let taken = std::mem::take(words);
+            ordered_lines.extend(group_words_into_lines(taken, label.clone(), false));
+        }
+    }
+
+    // Append filtered lines marked is_filtered = true so toggling Skip Headers off can still reveal them
+    for (drop_label, words) in filtered_buckets {
+        ordered_lines.extend(group_words_into_lines(
+            words,
+            Some(drop_label.to_string()),
+            true,
+        ));
+    }
+
+    ordered_lines
+}
+
 fn parse_pdf_sync(app: &AppHandle, path: &str) -> Result<Vec<PdfPageData>, String> {
     println!("Loading the library");
 
@@ -795,11 +976,21 @@ fn parse_pdf_sync(app: &AppHandle, path: &str) -> Result<Vec<PdfPageData>, Strin
         .load_pdf_from_file(path, None)
         .map_err(|e| format!("Failed to load PDF: {}", e))?;
 
+    let layout_detector = match get_or_init_layout_detector(app) {
+        Ok(det) => Some(det),
+        Err(err) => {
+            eprintln!("Layout detector unavailable, using fallback order: {}", err);
+            None
+        }
+    };
+
     println!("File loaded, starting the parsing");
 
     let mut pages_data = Vec::new();
 
     for (index, page) in document.pages().iter().enumerate() {
+        let page_width = page.width().value;
+        let page_height = page.height().value;
         let mut raw_elements = Vec::new();
 
         // 1. Collect all valid words on the page
@@ -822,9 +1013,11 @@ fn parse_pdf_sync(app: &AppHandle, path: &str) -> Result<Vec<PdfPageData>, Strin
                             el: PdfTextElement {
                                 text: normalized.trim().to_string(),
                                 x: bounds.left().value,
-                                y: page.height().value - bounds.top().value,
+                                y: page_height - bounds.top().value,
                                 width: bounds.width().value,
                                 height: bounds.height().value,
+                                layout_label: None,
+                                is_filtered: false,
                             },
                             had_leading_ws,
                             had_trailing_ws,
@@ -834,41 +1027,40 @@ fn parse_pdf_sync(app: &AppHandle, path: &str) -> Result<Vec<PdfPageData>, Strin
             }
         }
 
-        raw_elements.sort_by(|a, b| {
-            a.el.y
-                .partial_cmp(&b.el.y)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        let mut line_elements = Vec::new();
-        let mut current_line: Vec<RawPdfWord> = Vec::new();
-        let y_tolerance = 5.0; // Margin of error for words on the same line
-
-        // 3. Group words into lines
-        for item in raw_elements {
-            if current_line.is_empty() {
-                current_line.push(item);
-            } else {
-                let baseline_y = current_line[0].el.y;
-                // If the word is on the same vertical level
-                if (item.el.y - baseline_y).abs() <= y_tolerance {
-                    current_line.push(item);
-                } else {
-                    // Merge the current line and start a new one
-                    line_elements.push(merge_line_elements(&mut current_line));
-                    current_line.push(item);
+        // 2. Run PP-DocLayout ONNX layout detection on a 640x640 low-res render ("Detect & Intersect")
+        let line_elements = if let Some(det) = layout_detector.as_ref() {
+            let render_cfg = PdfRenderConfig::new()
+                .set_fixed_size(LAYOUT_INPUT_SIZE as Pixels, LAYOUT_INPUT_SIZE as Pixels);
+            match page.render_with_config(&render_cfg) {
+                Ok(bitmap) => {
+                    let rgba = bitmap.as_rgba_bytes();
+                    match det.detect_from_rgba(
+                        &rgba,
+                        LAYOUT_INPUT_SIZE,
+                        LAYOUT_INPUT_SIZE,
+                        page_width,
+                        page_height,
+                    ) {
+                        Ok(boxes) => process_page_with_layout(raw_elements, &boxes),
+                        Err(err) => {
+                            eprintln!("Layout detection failed on page {}: {}", index + 1, err);
+                            group_words_into_lines(raw_elements, None, false)
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Page render failed for layout on page {}: {}", index + 1, err);
+                    group_words_into_lines(raw_elements, None, false)
                 }
             }
-        }
-
-        if !current_line.is_empty() {
-            line_elements.push(merge_line_elements(&mut current_line));
-        }
+        } else {
+            group_words_into_lines(raw_elements, None, false)
+        };
 
         pages_data.push(PdfPageData {
             page_number: index as u16 + 1,
-            width: page.width().value,
-            height: page.height().value,
+            width: page_width,
+            height: page_height,
             elements: line_elements,
         });
     }
@@ -877,7 +1069,11 @@ fn parse_pdf_sync(app: &AppHandle, path: &str) -> Result<Vec<PdfPageData>, Strin
 }
 
 // Helper function to merge an array of words into a single line bounding box
-fn merge_line_elements(line: &mut Vec<RawPdfWord>) -> PdfTextElement {
+fn merge_line_elements(
+    line: &mut Vec<RawPdfWord>,
+    layout_label: Option<String>,
+    is_filtered: bool,
+) -> PdfTextElement {
     // Sort words left-to-right
     line.sort_by(|a, b| {
         a.el.x
@@ -933,6 +1129,8 @@ fn merge_line_elements(line: &mut Vec<RawPdfWord>) -> PdfTextElement {
         y: max_y,
         width: max_x - min_x,
         height: max_height,
+        layout_label,
+        is_filtered,
     };
 
     line.clear(); // Empty the vector so it can be reused for the next line
@@ -1133,6 +1331,7 @@ pub async fn export_audio_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout_detector::LayoutDetector;
 
     #[test]
     fn kokoro_runtime_synthesis_produces_wav() {
@@ -1190,6 +1389,8 @@ mod tests {
                     y: 100.0,
                     width: 30.0,
                     height: 10.0,
+                    layout_label: None,
+                    is_filtered: false,
                 },
                 had_leading_ws: false,
                 had_trailing_ws: true,
@@ -1201,6 +1402,8 @@ mod tests {
                     y: 100.0,
                     width: 30.0,
                     height: 10.0,
+                    layout_label: None,
+                    is_filtered: false,
                 },
                 had_leading_ws: false,
                 had_trailing_ws: false,
@@ -1208,7 +1411,104 @@ mod tests {
         ];
         // Re-trim as parse_pdf_sync does
         words[0].el.text = words[0].el.text.trim().to_string();
-        let merged = merge_line_elements(&mut words);
+        let merged = merge_line_elements(&mut words, Some("text".to_string()), false);
         assert_eq!(merged.text, "first result");
+        assert_eq!(merged.layout_label.as_deref(), Some("text"));
+        assert!(!merged.is_filtered);
+    }
+
+    #[test]
+    fn detect_and_intersect_sample_pdf() {
+        let pdf_path = Path::new("/tmp/test_paper.pdf");
+        let model_path = Path::new("resources/layout/pp-doclayout-l.onnx");
+        let labels_path = Path::new("resources/layout/labels.json");
+        let pdfium_path = Path::new("resources/libpdfium.so");
+        if !pdf_path.exists() || !model_path.exists() || !pdfium_path.exists() {
+            return;
+        }
+
+        let pdfium = Pdfium::new(
+            Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("resources"))
+                .expect("bind pdfium"),
+        );
+        let document = pdfium.load_pdf_from_file(pdf_path, None).expect("load pdf");
+        let page = document.pages().get(0).expect("page 0");
+        let det = LayoutDetector::load(model_path, labels_path).expect("load layout");
+
+        let mut raw_elements = Vec::new();
+        for object in page.objects().iter() {
+            if let Some(text_object) = object.as_text_object() {
+                let normalized = normalize_pdf_text(&text_object.text());
+                if normalized.chars().any(|c| c.is_alphanumeric()) {
+                    if let Ok(bounds) = text_object.bounds() {
+                        raw_elements.push(RawPdfWord {
+                            el: PdfTextElement {
+                                text: normalized.trim().to_string(),
+                                x: bounds.left().value,
+                                y: page.height().value - bounds.top().value,
+                                width: bounds.width().value,
+                                height: bounds.height().value,
+                                layout_label: None,
+                                is_filtered: false,
+                            },
+                            had_leading_ws: false,
+                            had_trailing_ws: false,
+                        });
+                    }
+                }
+            }
+        }
+
+        let render_cfg = PdfRenderConfig::new()
+            .set_fixed_size(LAYOUT_INPUT_SIZE as Pixels, LAYOUT_INPUT_SIZE as Pixels);
+        let bitmap = page.render_with_config(&render_cfg).expect("render");
+        let rgba = bitmap.as_rgba_bytes();
+
+        let t0 = std::time::Instant::now();
+        let boxes = det
+            .detect_from_rgba(
+                &rgba,
+                LAYOUT_INPUT_SIZE,
+                LAYOUT_INPUT_SIZE,
+                page.width().value,
+                page.height().value,
+            )
+            .expect("detect");
+        let elapsed = t0.elapsed();
+
+        println!("Detected {} boxes in {:?}:", boxes.len(), elapsed);
+        for b in &boxes {
+            println!(
+                "  {:?} ({:.2}) [{:.1}, {:.1}, {:.1}, {:.1}] -> {:?}",
+                b.label, b.score, b.x1, b.y1, b.x2, b.y2, b.action
+            );
+        }
+
+        let lines = process_page_with_layout(raw_elements, &boxes);
+        for l in &lines {
+            println!(
+                "  filtered={} label={:?} text={:?}",
+                l.is_filtered, l.layout_label, l.text
+            );
+        }
+
+        let kept: Vec<&str> = lines
+            .iter()
+            .filter(|l| !l.is_filtered)
+            .map(|l| l.text.as_str())
+            .collect();
+        let filtered: Vec<&str> = lines
+            .iter()
+            .filter(|l| l.is_filtered)
+            .map(|l| l.text.as_str())
+            .collect();
+
+        assert!(!kept.is_empty(), "Should keep body lines");
+        assert!(!filtered.is_empty(), "Should filter header/footer/number lines");
+
+        // Verify left column appears before right column
+        let left_pos = kept.iter().position(|t| t.contains("First column")).unwrap();
+        let right_pos = kept.iter().position(|t| t.contains("Right column")).unwrap();
+        assert!(left_pos < right_pos, "Left column should precede right column");
     }
 }

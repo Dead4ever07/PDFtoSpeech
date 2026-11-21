@@ -1,4 +1,4 @@
-import { ref, computed } from 'vue';
+import { ref, computed, watch } from 'vue';
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { open, save } from '@tauri-apps/plugin-dialog';
@@ -27,7 +27,18 @@ const currentExplanation = ref<ExplanationResult | null>(null);
 const isExportingAudio = ref<boolean>(false);
 const exportProgress = ref<{ current: number; total: number }>({ current: 0, total: 0 });
 
+interface PausedPlayback {
+  pageIndex: number;
+  sentenceIndex: number;
+  chunkIndex: number;
+  chunks: string[];
+  voice: string;
+  readingMode: ReadingMode;
+}
+
+const MAX_AUDIO_CACHE_ENTRIES = 32;
 let currentAudio: HTMLAudioElement | null = null;
+let pausedPlayback: PausedPlayback | null = null;
 const audioCache = ref<Map<string, string>>(new Map());
 const inFlightAudio = new Map<string, Promise<string | null>>();
 let playbackSessionId = 0;
@@ -61,8 +72,10 @@ function isParentheticalCitation(inner: string): boolean {
  */
 export function cleanAcademicText(raw: string): string {
   let cleaned = raw
-    // Join hyphenated words split across lines: "infor- \n mation" -> "information"
-    .replace(/(\b\w+)-\s+(\w+\b)/g, '$1$2')
+    // Join hyphenated words split across lines/spaces: "infor- mation" -> "information"
+    .replace(/([\p{L}\d])[-\u2010\u00AD]\s+([\p{L}])/gu, '$1$2')
+    // Strip any leftover invisible soft hyphens
+    .replace(/\u00AD/g, '')
     // Remove bracketed citations: "[1]", "[1, 2]", "[12-15]", "[4; 7]"
     .replace(/\[\s*\d+(?:[\s,;–-]+\d+)*\s*\]/g, '')
     // Remove complex author-date citations without nested quantifier backtracking: "(Smith et al., 2020)"
@@ -177,6 +190,20 @@ function splitIntoSpeechChunks(text: string, maxChars: number = 240): string[] {
   }
 
   return chunks;
+}
+
+function setCachedAudioUrl(key: string, url: string) {
+  if (audioCache.value.has(key)) {
+    audioCache.value.delete(key);
+  } else if (audioCache.value.size >= MAX_AUDIO_CACHE_ENTRIES) {
+    const oldestKey = audioCache.value.keys().next().value;
+    if (oldestKey !== undefined) {
+      const oldestUrl = audioCache.value.get(oldestKey);
+      if (oldestUrl) URL.revokeObjectURL(oldestUrl);
+      audioCache.value.delete(oldestKey);
+    }
+  }
+  audioCache.value.set(key, url);
 }
 
 function clearAudioCache() {
@@ -296,6 +323,7 @@ export function usePdfReader() {
   };
 
   const buildPageSentences = (page: PdfPageData): SentenceBlock[] => {
+    const hasLayoutTags = page.elements.some((e) => e.layout_label != null);
     const medianHeight = getMedianBodyHeight(page.elements);
     const sentences: SentenceBlock[] = [];
     let currentText = "";
@@ -323,17 +351,23 @@ export function usePdfReader() {
       const text = el.text.trim();
       if (!text) continue;
 
-      if (skipHeadersFooters.value && isHeaderOrFooterElement(page, i, medianHeight)) {
-        continue;
+      if (skipHeadersFooters.value) {
+        if (el.is_filtered) continue;
+        // Fallback heuristic only when ONNX layout tags are absent
+        if (!hasLayoutTags && isHeaderOrFooterElement(page, i, medianHeight)) {
+          continue;
+        }
       }
 
-      // Check if there is a massive vertical gap (a new paragraph)
+      // Check for paragraph/column gaps or heading transitions
       if (lastIncludedIndex >= 0) {
         const prevEl = page.elements[lastIncludedIndex];
         const gap = el.y - (prevEl.y + prevEl.height);
+        const labelChanged =
+          (prevEl.layout_label === 'doc_title' || prevEl.layout_label === 'paragraph_title') &&
+          prevEl.layout_label !== el.layout_label;
 
-        // If gap is larger than 1.5x line height, break sentence and mark a paragraph boundary
-        if (gap > prevEl.height * 1.5) {
+        if (labelChanged || gap > prevEl.height * 1.5) {
           flushSentence();
           nextStartsParagraph = true;
         }
@@ -341,8 +375,17 @@ export function usePdfReader() {
 
       lastIncludedIndex = i;
       const segments = splitLineIntoSegments(text);
-      for (const segment of segments) {
-        currentText += (currentText ? " " : "") + segment;
+      for (let segIdx = 0; segIdx < segments.length; segIdx++) {
+        const segment = segments[segIdx];
+        const endsWithWrapHyphen = /[\p{L}][-\u2010\u00AD]$/u.test(currentText);
+        const startsWithLower = /^[\p{Ll}]/u.test(segment);
+
+        if (segIdx === 0 && endsWithWrapHyphen && startsWithLower) {
+          currentText = currentText.slice(0, -1) + segment;
+        } else {
+          currentText += (currentText ? " " : "") + segment;
+        }
+
         if (currentIndices[currentIndices.length - 1] !== i) {
           currentIndices.push(i);
         }
@@ -404,7 +447,7 @@ export function usePdfReader() {
 
         const blob = new Blob([audioResponse], { type: 'audio/wav' });
         const url = URL.createObjectURL(blob);
-        audioCache.value.set(cacheKey, url);
+        setCachedAudioUrl(cacheKey, url);
         return url;
       } catch (error) {
         console.error("Piper TTS synthesis failed:", error);
@@ -434,25 +477,41 @@ export function usePdfReader() {
     }
   };
 
-  const readCurrentSentence = async () => {
-    if (!isPlaying.value) return;
+  const attachAudioLifecycle = (
+    audio: HTMLAudioElement,
+    chunkIndex: number,
+    chunks: string[],
+    sessionId: number,
+    onAdvanceChunk: (nextChunkIdx: number) => void
+  ) => {
+    audio.onended = () => {
+      if (!isPlaying.value || sessionId !== playbackSessionId) return;
 
-    const sessionId = ++playbackSessionId;
-    const pIndex = currentPageIndex.value;
-    const sIndex = currentSentenceIndex.value;
-    const textToSpeak = getTextForSentence(pIndex, sIndex);
+      if (chunkIndex + 1 < chunks.length) {
+        onAdvanceChunk(chunkIndex + 1);
+      } else {
+        pausedPlayback = null;
+        if (currentAudio === audio) currentAudio = null;
+        advanceAfterSentence();
+      }
+    };
 
-    if (!textToSpeak) {
-      isPlaying.value = false;
-      return;
-    }
+    audio.onerror = (e) => {
+      console.error("Audio playback error:", e);
+      if (sessionId === playbackSessionId) {
+        pausedPlayback = null;
+        isPlaying.value = false;
+      }
+    };
+  };
 
-    const chunks = splitIntoSpeechChunks(textToSpeak);
-    if (chunks.length === 0) {
-      nextSentence();
-      return;
-    }
-
+  const playSentenceFromChunk = async (
+    pIndex: number,
+    sIndex: number,
+    chunks: string[],
+    startChunkIndex: number,
+    sessionId: number
+  ) => {
     const playChunk = async (chunkIndex: number) => {
       if (!isPlaying.value || sessionId !== playbackSessionId) return;
 
@@ -473,6 +532,7 @@ export function usePdfReader() {
       if (!isPlaying.value || sessionId !== playbackSessionId) return;
 
       if (!audioUrl) {
+        pausedPlayback = null;
         isPlaying.value = false;
         return;
       }
@@ -485,29 +545,21 @@ export function usePdfReader() {
       const audio = new Audio(audioUrl);
       audio.playbackRate = speechSpeed.value;
       currentAudio = audio;
+      pausedPlayback = {
+        pageIndex: pIndex,
+        sentenceIndex: sIndex,
+        chunkIndex,
+        chunks,
+        voice: selectedVoice.value,
+        readingMode: readingMode.value
+      };
 
       // Pre-synthesize the next chunk (or next sentence) in the background
       prefetchNextTarget(pIndex, sIndex, chunkIndex, chunks);
 
-      audio.onended = () => {
-        URL.revokeObjectURL(audioUrl);
-        audioCache.value.delete(cacheKey);
-
-        if (!isPlaying.value || sessionId !== playbackSessionId) return;
-
-        if (chunkIndex + 1 < chunks.length) {
-          void playChunk(chunkIndex + 1);
-        } else {
-          advanceAfterSentence();
-        }
-      };
-
-      audio.onerror = (e) => {
-        console.error("Audio playback error:", e);
-        if (sessionId === playbackSessionId) {
-          isPlaying.value = false;
-        }
-      };
+      attachAudioLifecycle(audio, chunkIndex, chunks, sessionId, (nextIdx) => {
+        void playChunk(nextIdx);
+      });
 
       try {
         await audio.play();
@@ -519,7 +571,30 @@ export function usePdfReader() {
       }
     };
 
-    await playChunk(0);
+    await playChunk(startChunkIndex);
+  };
+
+  const readCurrentSentence = async () => {
+    if (!isPlaying.value) return;
+
+    const sessionId = ++playbackSessionId;
+    const pIndex = currentPageIndex.value;
+    const sIndex = currentSentenceIndex.value;
+    const textToSpeak = getTextForSentence(pIndex, sIndex);
+
+    if (!textToSpeak) {
+      pausedPlayback = null;
+      isPlaying.value = false;
+      return;
+    }
+
+    const chunks = splitIntoSpeechChunks(textToSpeak);
+    if (chunks.length === 0) {
+      nextSentence();
+      return;
+    }
+
+    await playSentenceFromChunk(pIndex, sIndex, chunks, 0, sessionId);
   };
 
   const setSpeechSpeed = (speed: number) => {
@@ -544,9 +619,25 @@ export function usePdfReader() {
 
   const setReadingMode = (mode: ReadingMode) => {
     readingMode.value = mode;
+    pausedPlayback = null;
+    if (currentAudio) {
+      currentAudio.pause();
+      currentAudio = null;
+    }
     // Clear cache so changes take effect immediately
     clearAudioCache();
   };
+
+  watch(selectedVoice, () => {
+    pausedPlayback = null;
+    if (currentAudio) {
+      currentAudio.pause();
+      currentAudio = null;
+    }
+    if (isPlaying.value) {
+      void readCurrentSentence();
+    }
+  });
 
   const toggleSkipHeadersFooters = () => {
     stopReading();
@@ -557,6 +648,7 @@ export function usePdfReader() {
   const jumpToSentence = (sIndex: number, autoPlay: boolean = true) => {
     if (sIndex < 0 || sIndex >= pageSentences.value.length) return;
     playbackSessionId++;
+    pausedPlayback = null;
     if (currentAudio) {
       currentAudio.pause();
       currentAudio.currentTime = 0;
@@ -630,6 +722,7 @@ export function usePdfReader() {
 
   const nextSentence = () => {
     playbackSessionId++;
+    pausedPlayback = null;
     if (currentAudio) {
       currentAudio.pause();
       currentAudio.currentTime = 0;
@@ -640,6 +733,7 @@ export function usePdfReader() {
 
   const prevSentence = () => {
     playbackSessionId++;
+    pausedPlayback = null;
     if (currentAudio) {
       currentAudio.pause();
       currentAudio.currentTime = 0;
@@ -671,18 +765,74 @@ export function usePdfReader() {
     }
   };
 
+  const pauseReading = () => {
+    playbackSessionId++;
+    isPlaying.value = false;
+    isGeneratingAudio.value = false;
+    if (currentAudio && !currentAudio.ended) {
+      currentAudio.pause();
+    } else {
+      pausedPlayback = null;
+    }
+  };
+
+  const resumeReading = async () => {
+    if (
+      currentAudio &&
+      pausedPlayback &&
+      pausedPlayback.pageIndex === currentPageIndex.value &&
+      pausedPlayback.sentenceIndex === currentSentenceIndex.value &&
+      pausedPlayback.voice === selectedVoice.value &&
+      pausedPlayback.readingMode === readingMode.value &&
+      !currentAudio.ended
+    ) {
+      const resumed = pausedPlayback;
+      const audio = currentAudio;
+      const sessionId = ++playbackSessionId;
+
+      isPlaying.value = true;
+      audio.playbackRate = speechSpeed.value;
+      attachAudioLifecycle(
+        audio,
+        resumed.chunkIndex,
+        resumed.chunks,
+        sessionId,
+        (nextChunkIdx) => {
+          void playSentenceFromChunk(
+            resumed.pageIndex,
+            resumed.sentenceIndex,
+            resumed.chunks,
+            nextChunkIdx,
+            sessionId
+          );
+        }
+      );
+
+      try {
+        await audio.play();
+        return;
+      } catch (err) {
+        console.error("Failed to resume paused audio:", err);
+        pausedPlayback = null;
+      }
+    }
+
+    isPlaying.value = true;
+    if (currentSentenceIndex.value === -1) currentSentenceIndex.value = 0;
+    await readCurrentSentence();
+  };
+
   const toggleReading = () => {
     if (isPlaying.value) {
-      stopReading();
+      pauseReading();
     } else {
-      isPlaying.value = true;
-      if (currentSentenceIndex.value === -1) currentSentenceIndex.value = 0;
-      readCurrentSentence();
+      void resumeReading();
     }
   };
 
   const stopReading = () => {
     playbackSessionId++;
+    pausedPlayback = null;
     isPlaying.value = false;
     isGeneratingAudio.value = false;
     if (currentAudio) {

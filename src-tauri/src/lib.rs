@@ -1,3 +1,4 @@
+pub mod layout_detector;
 pub mod models;
 pub mod pdf_handler;
 
@@ -7,11 +8,18 @@ pub fn run() {
         .manage(pdf_handler::PiperState::default())
         .manage(pdf_handler::KokoroState::default())
         .manage(pdf_handler::ExportState::default())
+        .manage(layout_detector::LayoutState::default())
         .setup(|app| {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(err) = pdf_handler::warmup_kokoro(&handle).await {
                     eprintln!("Kokoro warmup skipped: {}", err);
+                }
+            });
+            let layout_handle = app.handle().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Err(err) = layout_detector::warmup_layout(&layout_handle) {
+                    eprintln!("PP-DocLayout warmup skipped: {}", err);
                 }
             });
             Ok(())

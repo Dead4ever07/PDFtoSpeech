@@ -4,6 +4,8 @@ export interface PdfTextElement {
   y: number;
   width: number;
   height: number;
+  layout_label?: string | null;
+  is_filtered?: boolean;
 }
 
 export interface PdfPageData {

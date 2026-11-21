@@ -107,9 +107,9 @@
           class="filter-toggle-btn"
           :class="{ active: skipHeadersFooters }"
           @click="toggleSkipHeadersFooters"
-          title="Automatically skip running page headers, footers, and page numbers"
+          title="AI Layout Filter: automatically skip headers, footers, page numbers, footnotes, captions, and sidebars"
         >
-          Skip Headers
+          Skip Layout Noise
         </button>
       </div>
 

@@ -289,6 +289,7 @@ mkdir -p "$RESOURCES_DIR/piper"
 mkdir -p "$RESOURCES_DIR/models/alba"
 mkdir -p "$RESOURCES_DIR/models/joe"
 mkdir -p "$RESOURCES_DIR/kokoro"
+mkdir -p "$RESOURCES_DIR/layout"
 
 # 1. libpdfium.so
 PDFIUM_SO="$RESOURCES_DIR/libpdfium.so"
@@ -359,6 +360,23 @@ if [ ! -s "$KOKORO_VOICES" ]; then
   curl -sSL "$KOKORO_VOICES_URL" -o "$KOKORO_VOICES"
 fi
 log_info "Kokoro voices bundle: OK"
+
+# 6. PP-DocLayout-L INT8 ONNX model and labels
+LAYOUT_ONNX="$RESOURCES_DIR/layout/pp-doclayout-l.onnx"
+if [ ! -s "$LAYOUT_ONNX" ]; then
+  log_info "Downloading PP-DocLayout-L INT8 ONNX model..."
+  LAYOUT_URL="https://huggingface.co/Ralutet/PP-DocLayout-L-onnx-int8/resolve/main/pp-doclayout-l.onnx"
+  curl -sSL "$LAYOUT_URL" -o "$LAYOUT_ONNX"
+fi
+log_info "PP-DocLayout-L model: OK"
+
+LAYOUT_LABELS="$RESOURCES_DIR/layout/labels.json"
+if [ ! -s "$LAYOUT_LABELS" ]; then
+  log_info "Downloading PP-DocLayout-L labels..."
+  LAYOUT_LABELS_URL="https://huggingface.co/Ralutet/PP-DocLayout-L-onnx-int8/raw/main/labels.json"
+  curl -sSL "$LAYOUT_LABELS_URL" -o "$LAYOUT_LABELS"
+fi
+log_info "PP-DocLayout-L labels: OK"
 
 # ==============================================================================
 # Step 5: Install Project Dependencies

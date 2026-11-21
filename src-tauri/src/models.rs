@@ -1,12 +1,14 @@
 use serde::Serialize;
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct PdfTextElement {
     pub text: String,
     pub x: f32,
     pub y: f32,
     pub width: f32,
     pub height: f32,
+    pub layout_label: Option<String>,
+    pub is_filtered: bool,
 }
 
 #[derive(Serialize)]
