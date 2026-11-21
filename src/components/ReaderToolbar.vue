@@ -166,19 +166,8 @@
 
       <div class="divider"></div>
 
-      <!-- Explanatory & Export Actions -->
-      <div class="control-group explain-group">
-        <button
-          class="explain-btn"
-          :class="{ 'is-explaining': isExplaining }"
-          @click="requestExplanation"
-          :disabled="currentSentenceIndex === -1"
-          title="Explain current sentence/concept in intuitive plain English"
-        >
-          <span class="explain-icon">💡</span>
-          <span>Explain</span>
-        </button>
-
+      <!-- Export Action -->
+      <div class="control-group export-group">
         <button
           class="export-btn"
           @click="exportFullText"
@@ -233,7 +222,6 @@ const {
   currentSentenceIndex,
   currentSentence,
   pageSentences,
-  isExplaining,
   isExportingAudio,
   exportProgress,
   toggleReading,
@@ -249,7 +237,6 @@ const {
   resetZoom,
   setReadingMode,
   toggleSkipHeadersFooters,
-  requestExplanation,
   exportFullText,
   cancelAudioExport
 } = usePdfReader();
@@ -512,33 +499,6 @@ const handleSpeedChange = (event: Event) => {
   padding: 0 6px;
   color: var(--text-secondary, #475569);
   cursor: pointer;
-}
-
-/* Explain Button */
-.explain-btn {
-  background: linear-gradient(135deg, #8b5cf6 0%, #6d28d9 100%);
-  color: white;
-  border: none;
-  border-radius: 8px;
-  padding: 6px 14px;
-  font-size: 12px;
-  font-weight: 700;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  box-shadow: 0 2px 6px rgba(139, 92, 246, 0.3);
-  transition: all 0.15s;
-}
-
-.explain-btn:hover:not(:disabled) {
-  transform: translateY(-1px);
-  box-shadow: 0 4px 10px rgba(139, 92, 246, 0.4);
-}
-
-.explain-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
 }
 
 .export-btn {

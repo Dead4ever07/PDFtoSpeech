@@ -22,11 +22,5 @@ export interface SentenceBlock {
   startsParagraph?: boolean;
 }
 
-export type ReadingMode = 'verbatim' | 'clean' | 'explanatory';
+export type ReadingMode = 'verbatim' | 'clean';
 export type AppTheme = 'light' | 'sepia' | 'dark';
-
-export interface ExplanationResult {
-  summary: string;
-  intuition: string;
-  terms: { term: string; definition: string }[];
-}

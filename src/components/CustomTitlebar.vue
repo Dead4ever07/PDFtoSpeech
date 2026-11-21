@@ -24,9 +24,6 @@
           <div class="dropdown-item" @click.stop="toggleSidebar('transcript')">
             <span>📝</span> Toggle Transcript
           </div>
-          <div class="dropdown-item" @click.stop="toggleSidebar('explain')">
-            <span>💡</span> Explanatory Insights
-          </div>
         </div>
       </div>
 
@@ -83,9 +80,9 @@
         class="sidebar-toggle-btn"
         :class="{ active: isSidebarOpen }"
         @click="isSidebarOpen = !isSidebarOpen"
-        title="Toggle Academic Assistant Panel"
+        title="Toggle Transcript & Pages Panel"
       >
-        <span>💡 Assistant</span>
+        <span>📝 Sidebar</span>
       </button>
 
       <!-- Standard Window Controls -->
@@ -143,7 +140,7 @@ const handleExportAudio = async () => {
   await exportFullAudio();
 };
 
-const toggleSidebar = (tab: 'transcript' | 'explain') => {
+const toggleSidebar = (tab: 'transcript' | 'pages') => {
   isFileMenuOpen.value = false;
   activeSidebarTab.value = tab;
   isSidebarOpen.value = true;

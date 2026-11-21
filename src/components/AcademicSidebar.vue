@@ -11,13 +11,6 @@
         </button>
         <button
           class="tab-btn"
-          :class="{ active: activeSidebarTab === 'explain' }"
-          @click="activeSidebarTab = 'explain'"
-        >
-          <span>💡 Insights</span>
-        </button>
-        <button
-          class="tab-btn"
           :class="{ active: activeSidebarTab === 'pages' }"
           @click="activeSidebarTab = 'pages'"
         >
@@ -25,7 +18,7 @@
         </button>
       </div>
 
-      <button class="close-sidebar-btn" @click="isSidebarOpen = false" title="Close Assistant">
+      <button class="close-sidebar-btn" @click="isSidebarOpen = false" title="Close Sidebar">
         ✕
       </button>
     </div>
@@ -62,71 +55,7 @@
         </div>
       </div>
 
-      <!-- Tab 2: Explanatory Assistant / Dissertation Demystifier -->
-      <div v-else-if="activeSidebarTab === 'explain'" class="explain-view">
-        <div class="section-title">
-          <span>Doctoral Thesis Explainer</span>
-        </div>
-
-        <div class="explain-card hero-card">
-          <h4>💡 Research Translation</h4>
-          <p class="card-desc">
-            Translates dense academic prose, complex formulas, and methodological jargon into intuitive, plain concepts.
-          </p>
-
-          <button
-            class="action-explain-btn"
-            :class="{ loading: isExplaining }"
-            @click="requestExplanation"
-            :disabled="currentSentenceIndex === -1"
-          >
-            <span v-if="isExplaining">Synthesizing Explanation...</span>
-            <span v-else>🔍 Unpack Active Sentence</span>
-          </button>
-        </div>
-
-        <div v-if="currentExplanation" class="explanation-results">
-          <!-- Core Takeaway -->
-          <div class="insight-block">
-            <h5>🎯 Core Claim / Takeaway</h5>
-            <p>{{ currentExplanation.summary }}</p>
-          </div>
-
-          <!-- Intuition / Analogy -->
-          <div class="insight-block intuition-block">
-            <h5>🧩 Plain-English Intuition</h5>
-            <p>{{ currentExplanation.intuition }}</p>
-          </div>
-
-          <!-- Demystified Jargon -->
-          <div v-if="currentExplanation.terms.length > 0" class="insight-block">
-            <h5>📖 Academic Terminology</h5>
-            <div class="terms-list">
-              <div v-for="(t, idx) in currentExplanation.terms" :key="idx" class="term-item">
-                <span class="term-badge">{{ t.term }}</span>
-                <span class="term-def">{{ t.definition }}</span>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div v-else class="explain-empty">
-          <span class="empty-icon">🎓</span>
-          <p>Select any sentence or click <strong>Unpack Active Sentence</strong> to generate an explanatory breakdown of the dissertation argument.</p>
-        </div>
-
-        <!-- Academic Reader Tips -->
-        <div class="academic-tips">
-          <h6>Academic Reading Tips:</h6>
-          <ul>
-            <li><strong>Clean Mode:</strong> Automatically strips citation noise like <code>[1-3]</code> and <code>(Author, 2022)</code>.</li>
-            <li><strong>Click to Listen:</strong> Click any sentence on the PDF page to immediately play audio.</li>
-            <li><strong>Speed Adjustment:</strong> Speed up literature reviews to 1.35x–1.5x to absorb content faster.</li>
-          </ul>
-        </div>
-      </div>
-
-      <!-- Tab 3: Fast Page Grid Navigation -->
+      <!-- Tab 2: Fast Page Grid Navigation -->
       <div v-else-if="activeSidebarTab === 'pages'" class="pages-view">
         <div class="section-title">
           <span>Document Navigation</span>
@@ -161,11 +90,8 @@ const {
   readingMode,
   isSidebarOpen,
   activeSidebarTab,
-  isExplaining,
-  currentExplanation,
   jumpToSentence,
-  jumpToPage,
-  requestExplanation
+  jumpToPage
 } = usePdfReader();
 </script>
 
@@ -318,166 +244,6 @@ const {
 .preview-tag {
   font-weight: 600;
   color: #10b981;
-}
-
-/* Explain View */
-.hero-card {
-  background: var(--hero-card-bg, linear-gradient(135deg, #f5f3ff 0%, #ede9fe 100%));
-  border: 1px solid var(--hero-card-border, #ddd6fe);
-  padding: 14px;
-  border-radius: 10px;
-  margin-bottom: 16px;
-}
-
-.hero-card h4 {
-  margin: 0 0 6px 0;
-  font-size: 14px;
-  color: var(--hero-card-title, #5b21b6);
-}
-
-.card-desc {
-  font-size: 12px;
-  color: var(--hero-card-desc, #6d28d9);
-  line-height: 1.4;
-  margin: 0 0 12px 0;
-}
-
-.action-explain-btn {
-  width: 100%;
-  background: linear-gradient(135deg, #7c3aed 0%, #6d28d9 100%);
-  color: white;
-  border: none;
-  padding: 8px 14px;
-  border-radius: 8px;
-  font-size: 12px;
-  font-weight: 700;
-  cursor: pointer;
-  transition: all 0.15s;
-  box-shadow: 0 2px 4px rgba(124, 58, 237, 0.25);
-}
-
-.action-explain-btn:hover:not(:disabled) {
-  transform: translateY(-1px);
-  box-shadow: 0 4px 8px rgba(124, 58, 237, 0.35);
-}
-
-.action-explain-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.action-explain-btn.loading {
-  background: #6d28d9;
-}
-
-.explanation-results {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  margin-bottom: 16px;
-}
-
-.insight-block {
-  background: var(--card-bg, #ffffff);
-  border: 1px solid var(--border-color, #e2e8f0);
-  border-radius: 8px;
-  padding: 12px;
-}
-
-.insight-block h5 {
-  margin: 0 0 6px 0;
-  font-size: 12px;
-  color: var(--text-primary, #0f172a);
-}
-
-.insight-block p {
-  margin: 0;
-  font-size: 13px;
-  line-height: 1.5;
-  color: var(--text-secondary, #334155);
-}
-
-.intuition-block {
-  background: var(--intuition-bg, #f0fdf4);
-  border-color: var(--intuition-border, #bbf7d0);
-}
-
-.intuition-block h5 {
-  color: var(--intuition-title, #166534);
-}
-
-.intuition-block p {
-  color: var(--intuition-text, #14532d);
-}
-
-.terms-list {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin-top: 6px;
-}
-
-.term-item {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  background: var(--badge-bg, #f8fafc);
-  padding: 6px 8px;
-  border-radius: 6px;
-}
-
-.term-badge {
-  font-weight: 700;
-  font-size: 11px;
-  color: var(--term-badge-color, #7c3aed);
-}
-
-.term-def {
-  font-size: 11px;
-  color: var(--text-secondary, #475569);
-  line-height: 1.3;
-}
-
-.explain-empty {
-  text-align: center;
-  padding: 30px 10px;
-  color: var(--text-muted, #94a3b8);
-}
-
-.empty-icon {
-  font-size: 32px;
-  display: block;
-  margin-bottom: 8px;
-}
-
-.explain-empty p {
-  font-size: 12px;
-  line-height: 1.5;
-  margin: 0;
-}
-
-.academic-tips {
-  background: var(--badge-bg, #f8fafc);
-  border: 1px solid var(--border-color, #e2e8f0);
-  border-radius: 8px;
-  padding: 12px;
-  font-size: 11px;
-}
-
-.academic-tips h6 {
-  margin: 0 0 6px 0;
-  font-size: 11px;
-  font-weight: 700;
-  color: var(--text-primary, #0f172a);
-}
-
-.academic-tips ul {
-  margin: 0;
-  padding-left: 16px;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  color: var(--text-secondary, #475569);
 }
 
 /* Page Grid View */

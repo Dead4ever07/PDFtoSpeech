@@ -3,7 +3,7 @@ import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { open, save } from '@tauri-apps/plugin-dialog';
 
-import type { PdfPageData, SentenceBlock, ReadingMode, AppTheme, ExplanationResult } from '../types/pdf';
+import type { PdfPageData, SentenceBlock, ReadingMode, AppTheme } from '../types/pdf';
 
 // Global application state
 const pdfPath = ref<string>('');
@@ -21,9 +21,7 @@ const theme = ref<AppTheme>('light');
 const readingMode = ref<ReadingMode>('clean');
 const skipHeadersFooters = ref<boolean>(true);
 const isSidebarOpen = ref<boolean>(false);
-const activeSidebarTab = ref<'transcript' | 'explain' | 'pages'>('transcript');
-const isExplaining = ref<boolean>(false);
-const currentExplanation = ref<ExplanationResult | null>(null);
+const activeSidebarTab = ref<'transcript' | 'pages'>('transcript');
 const isExportingAudio = ref<boolean>(false);
 const exportProgress = ref<{ current: number; total: number }>({ current: 0, total: 0 });
 
@@ -419,7 +417,7 @@ export function usePdfReader() {
     const sentence = pageSentences.value[sIndex];
     if (!sentence) return null;
 
-    if (readingMode.value === 'clean' || readingMode.value === 'explanatory') {
+    if (readingMode.value === 'clean') {
       return sentence.cleanedText || cleanAcademicText(sentence.text);
     }
     return sentence.text;
@@ -698,7 +696,6 @@ export function usePdfReader() {
       pdfPages.value = await invoke<PdfPageData[]>('parse_pdf', { path: pdfPath.value });
       currentSentenceIndex.value = -1;
       currentPageIndex.value = 0;
-      currentExplanation.value = null;
     } catch (error) {
       console.error("Error loading PDF document:", error);
       alert(`Could not load document: ${error}`);
@@ -843,66 +840,8 @@ export function usePdfReader() {
     clearAudioCache();
   };
 
-  /**
-   * Explanatory Engine for Doctoral Theses:
-   * Translates the active sentence or paragraph into intuitive concepts.
-   */
-  const requestExplanation = async () => {
-    const activeSentence = currentSentence.value;
-    if (!activeSentence) return;
-
-    isExplaining.value = true;
-    try {
-      // Collect surrounding paragraph context (current sentence +/- 1)
-      const sIndex = currentSentenceIndex.value;
-      const prev = sIndex > 0 ? pageSentences.value[sIndex - 1].text : '';
-      const curr = activeSentence.text;
-      const next = sIndex < pageSentences.value.length - 1 ? pageSentences.value[sIndex + 1].text : '';
-      const context = [prev, curr, next].filter(Boolean).join(" ");
-
-      // Rule-based academic extractor & synthesis
-      const isMethodological = /method|algorithm|equation|theorem|model|framework|sample|dataset/i.test(context);
-      const isResults = /increase|decrease|significant|p-value|accuracy|correlate|observed|demonstrate/i.test(context);
-
-      let summary = "";
-      let intuition = "";
-      const terms: { term: string; definition: string }[] = [];
-
-      if (isMethodological) {
-        summary = "Methodology & Architecture: The author describes how the model or experiment was designed and formalized.";
-        intuition = "Think of this as setting up the rules and measuring instruments of the research before testing the hypotheses.";
-      } else if (isResults) {
-        summary = "Empirical Finding: Discusses observed quantitative or qualitative metrics and behavioral trends.";
-        intuition = "The research highlights concrete evidence answering the central dissertation research question.";
-      } else {
-        summary = "Conceptual Argument: Establishes theoretical grounding or synthesizes prior scientific literature.";
-        intuition = "The dissertation connects this claim with the broader consensus and identified gaps in the field.";
-      }
-
-      // Detect potential jargon acronyms (2-5 capital letters)
-      const acronymMatches = context.match(/\b[A-Z]{2,6}\b/g) || [];
-      const uniqueAcronyms = [...new Set(acronymMatches)];
-      uniqueAcronyms.slice(0, 3).forEach(term => {
-        terms.push({
-          term,
-          definition: `Core domain acronym used in this thesis context to represent a specific model, metric, or framework.`
-        });
-      });
-
-      currentExplanation.value = {
-        summary,
-        intuition,
-        terms
-      };
-      isSidebarOpen.value = true;
-      activeSidebarTab.value = 'explain';
-    } finally {
-      isExplaining.value = false;
-    }
-  };
-
   const getSentenceReadText = (sentence: SentenceBlock): string => {
-    if (readingMode.value === 'clean' || readingMode.value === 'explanatory') {
+    if (readingMode.value === 'clean') {
       return sentence.cleanedText || cleanAcademicText(sentence.text);
     }
     return sentence.text;
@@ -1054,8 +993,6 @@ export function usePdfReader() {
     pageSentences,
     isSidebarOpen,
     activeSidebarTab,
-    isExplaining,
-    currentExplanation,
     isExportingAudio,
     exportProgress,
     openFile,
@@ -1076,7 +1013,6 @@ export function usePdfReader() {
     setTheme,
     setReadingMode,
     toggleSkipHeadersFooters,
-    requestExplanation,
     exportFullText,
     exportFullAudio,
     cancelAudioExport
